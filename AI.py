@@ -415,6 +415,7 @@ class ChessBot:
 
     def ponder_indefinitely(self):
         try:
+            self.stop_time = None  # Infinite time budget for analysis
             self._age_history_table()
             if is_insufficient_material(self.board): return
 
@@ -508,6 +509,9 @@ class ChessBot:
                 best_move_this_iter  = move
             if best_score_this_iter > alpha:
                 alpha = best_score_this_iter
+
+        if best_move_this_iter is not None:
+            self._store_tt(root_hash, best_score_this_iter, depth, TT_FLAG_EXACT, best_move_this_iter)
 
         return best_score_this_iter, best_move_this_iter
 

@@ -69,7 +69,7 @@ def board_hash(board, turn):
 
 
 def incremental_hash(parent_hash, record_tuple):
-    start, end, mp, removed, added, old_c, old_ep, _, special = record_tuple
+    start, end, mp, removed, added, old_c, old_ep, _, special, new_c, new_ep = record_tuple
     h = parent_hash ^ ZOBRIST_TURN
     arr = ZOBRIST_ARRAY
     c_idx = 0 if mp.color == "white" else 1
@@ -97,10 +97,17 @@ def incremental_hash(parent_hash, record_tuple):
         elif end[1] == 2:
             h ^= arr[c_idx][3][sr][0] ^ arr[c_idx][3][sr][3]
 
-    # Castling rights & EP difference
-    h ^= ZOBRIST_CASTLE[old_c]
-    if old_ep:
-        h ^= ZOBRIST_EP[old_ep[1]]
+    # Castling rights difference
+    if old_c != new_c:
+        h ^= ZOBRIST_CASTLE[old_c] ^ ZOBRIST_CASTLE[new_c]
+
+    # En Passant difference
+    if old_ep != new_ep:
+        if old_ep:
+            h ^= ZOBRIST_EP[old_ep[1]]
+        if new_ep:
+            h ^= ZOBRIST_EP[new_ep[1]]
+
     return h
 
 
@@ -216,6 +223,7 @@ def update_bot_runtime_state(bot, board, color, position_counts, comm_queue,
     bot.bot_name = bot_name
     bot.ply_count = ply_count
     bot.game_mode = game_mode
+    bot.stop_time = None  # Reset stale stop_time from previous searches
 
     bot.time_left = kwargs.get("time_left")
     bot.increment = kwargs.get("increment")
@@ -468,6 +476,9 @@ def get_pv_data(bot, max_depth, root_move):
         p = current_board.grid[move[0][0]][move[0][1]]
         if not p or p.color != current_turn: break
 
+        legal_moves = get_all_legal_moves(current_board, current_turn)
+        if move not in legal_moves: break
+
         san      = format_bot_move(bot, current_board, move)
         move_num = (current_ply // 2) + 1
         if current_turn == 'white':
@@ -486,7 +497,6 @@ def get_pv_data(bot, max_depth, root_move):
 
         tt_entry = bot.tt.get(h)
         if not tt_entry or not tt_entry.best_move: break
-        if tt_entry.flag != TT_FLAG_EXACT: break
         move = tt_entry.best_move
 
     return pv_san, pv_raw

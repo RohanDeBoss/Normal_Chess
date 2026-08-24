@@ -617,8 +617,10 @@ class EnhancedChessApp:
         elif mode == GameMode.AI_VS_AI.value:
             if not self.game_over:
                 self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
-        else:
+        elif mode == GameMode.HUMAN_VS_HUMAN.value:
+            self.board_orientation = "white"
             self._update_analysis_after_state_change()
+
         self._update_flip_view_button_style()
         self.update_ui_after_state_change()
 
@@ -1617,9 +1619,10 @@ class EnhancedChessApp:
         if self.active_worker_name is not None:
             return   
 
-        time_left = (self.white_time if self.turn == 'white' else self.black_time) \
-                    if self.use_clock_var.get() else None
-        inc = self.increment if self.use_clock_var.get() else None
+        is_analysis = (bot_name == self.ANALYSIS_AI_NAME)
+        time_left = ((self.white_time if self.turn == 'white' else self.black_time) \
+                    if self.use_clock_var.get() else None) if not is_analysis else None
+        inc = (self.increment if self.use_clock_var.get() else None) if not is_analysis else None
 
         self.current_task_id += 1  # Increment task generation
 

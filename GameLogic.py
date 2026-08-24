@@ -351,10 +351,10 @@ class Board:
             elif (er, ec) == (0, 7): self.castling_rights &= ~CASTLE_BK
             elif (er, ec) == (0, 0): self.castling_rights &= ~CASTLE_BQ
 
-        return (start, end, moving_piece, removed, added, old_castling, old_ep, old_halfmove, special)
+        return (start, end, moving_piece, removed, added, old_castling, old_ep, old_halfmove, special, self.castling_rights, self.ep_square)
 
     def unmake_move(self, record_tuple):
-        start, end, moving_piece, removed, added, old_castling, old_ep, old_halfmove, special = record_tuple
+        start, end, moving_piece, removed, added, old_castling, old_ep, old_halfmove, special = record_tuple[:9]
         self.castling_rights = old_castling
         self.ep_square       = old_ep
         self.halfmove_clock  = old_halfmove

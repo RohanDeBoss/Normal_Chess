@@ -1,0 +1,1035 @@
+# AI.py (v1)
+
+import time
+import random
+from operator import itemgetter
+from GameLogic import *
+from EngineRuntime import (
+    OPENING_BOOK,
+    ZOBRIST_TURN,
+    SearchCancelledException,
+    TT_FLAG_EXACT,
+    TT_FLAG_LOWERBOUND,
+    TT_FLAG_UPPERBOUND,
+    TTEntry,
+    board_hash,
+    board_to_fen,
+    build_flat_pst_tables,
+    calc_time_check_mask,
+    format_bot_move,
+    get_pv_data,
+    incremental_hash,
+    update_bot_runtime_state,
+)
+
+# --- EVALUATION CONSTANTS ---
+MG_PIECE_VALUES = {
+    Pawn: 100,
+    Knight: 320,
+    Bishop: 330,
+    Rook: 500,
+    Queen: 950,
+    King: 20000
+}
+
+EG_PIECE_VALUES = {
+    Pawn: 110,
+    Knight: 300,
+    Bishop: 340,
+    Rook: 550,
+    Queen: 920,
+    King: 20000
+}
+
+ORDERING_VALUES = [
+    MG_PIECE_VALUES[Pawn],
+    MG_PIECE_VALUES[Knight],
+    MG_PIECE_VALUES[Bishop],
+    MG_PIECE_VALUES[Rook],
+    MG_PIECE_VALUES[Queen],
+    MG_PIECE_VALUES[King]
+]
+
+INITIAL_PHASE_MATERIAL = (MG_PIECE_VALUES[Knight] * 4 + MG_PIECE_VALUES[Bishop] * 4 +
+                          MG_PIECE_VALUES[Rook] * 4 + MG_PIECE_VALUES[Queen] * 2)
+
+# (Move packing helpers removed to eliminate inner-loop function overhead and ensure tuple consistency)
+
+# --- SEARCH STRUCTURES ---
+# TTEntry / TT_FLAG_* now live in EngineRuntime.py as shared, non-tunable
+# infrastructure — every bot subclass needs the exact same TT record format.
+
+
+class ChessBot:
+    search_depth = 6
+    MATE_SCORE = 1000000
+    DRAW_SCORE = 0
+
+    MAX_Q_SEARCH_DEPTH = 12
+    LMR_DEPTH_THRESHOLD = 3
+    LMR_MOVE_COUNT_THRESHOLD = 4
+    NMP_MIN_DEPTH = 3
+    NMP_BASE_REDUCTION = 2
+    NMP_DEPTH_DIVISOR = 6
+    USE_NULL_MOVE_PRUNING = True
+
+    USE_FUTILITY_PRUNING = True
+    FUTILITY_MARGIN = 350
+
+    USE_REVERSE_FUTILITY_PRUNING = True
+    RFP_MAX_DEPTH = 2
+    RFP_MARGIN_PER_DEPTH = 150
+
+    USE_IIR = True
+    IIR_MIN_DEPTH = 4
+
+    TT_MAX_SIZE = 6_000_000
+    EVAL_TT_MAX_SIZE = 3_000_000
+
+    BONUS_PV_MOVE = 10_000_000
+    BONUS_CAPTURE = 8_000_000
+    BONUS_KILLER_1 = 4_000_000
+    BONUS_KILLER_2 = 3_000_000
+    ASP_WINDOW_INIT = 60
+    ASP_MAX_RETRIES = 3
+
+    TIME_BUFFER_SEC = 0.40
+    TIME_BUFFER_PCT = 0.05
+    MIN_MOVE_TIME = 0.03
+    TIME_DIVISOR_BASE = 45
+    TIME_DIVISOR_HEALTH_WEIGHT = 20
+    TIME_INCREMENT_WEIGHT = 0.8
+    TIME_MAX_MULTIPLIER = 3.0
+
+    MAX_EXTENSION_DEPTH = 16
+
+    EVAL_BISHOP_PAIR = 30
+    EVAL_ROOK_OPEN_FILE = 20
+    EVAL_ROOK_SEMI_OPEN = 10
+    EVAL_PASSED_PAWN_RANK = [0, 5, 10, 20, 35, 60, 100, 0]
+
+    def __init__(self, board, color, position_counts, comm_queue, cancellation_event,
+                 bot_name=None, ply_count=0, game_mode="bot", max_moves=200,
+                 time_left=None, increment=None, use_opening_book=True,
+                 show_tt_fullness=False):
+        self.show_tt_fullness = show_tt_fullness
+
+        self.board = board
+        self.color = color
+        self.opponent_color = 'black' if color == 'white' else 'white'
+        self.position_counts = position_counts
+        self.comm_queue = comm_queue
+        self.cancellation_event = cancellation_event
+        self.ply_count = ply_count
+        self.game_mode = game_mode
+        self.max_moves = max_moves
+
+        self.time_left = time_left
+        self.increment = increment
+        self.stop_time = None
+        
+        if time_left:
+             allocated = (self.time_left / 30.0) + (self.increment * 0.8)
+             self.time_check_mask = self._calc_time_check_mask(allocated)
+        else:
+             self.time_check_mask = 511
+
+        self.use_opening_book = use_opening_book
+
+        if bot_name is None:
+            self.bot_name = "OP Bot" if self.__class__.__name__ == "OpponentAI" else "AI Bot"
+        else:
+            self.bot_name = bot_name
+
+        self._initialize_search_state()
+
+    def _initialize_search_state(self):
+        self.tt = {}
+        self.eval_tt = {}
+        self.current_age = 0
+        self.nodes_searched = 0
+        self.used_heuristic_eval = False
+        self.tb_hits = 0
+        self.killer_moves = [[None, None] for _ in range(max(200, self.max_moves))]
+        self.history_heuristic_table = [[[0 for _ in range(64)] for _ in range(64)] for _ in range(2)]
+        self.counter_moves = [[[None for _ in range(64)] for _ in range(64)] for _ in range(2)]
+        # [color][prev_piece_type][prev_to_sq][my_piece_type][my_to_sq]
+        self.continuation_history = [[[[[0] * 64 for _ in range(6)] for _ in range(64)] for _ in range(6)] for _ in range(2)]
+
+    def update_state(self, board, color, position_counts, comm_queue, cancellation_event, bot_name, ply_count, game_mode, **kwargs):
+        """Called by the persistent worker to update the bot's state for the next turn without wiping memory."""
+        update_bot_runtime_state(
+            self, board, color, position_counts, comm_queue, cancellation_event,
+            bot_name, ply_count, game_mode, **kwargs
+        )
+
+    def _get_cached_static_eval(self, board, turn, hash_val):
+        """
+        Static eval is purely a function of (board, turn) — no depth or alpha/beta
+        dependence — so it's safe to cache and reuse across any node that
+        transposes to the same position, exactly like qsearch's stand_pat cache.
+        """
+        cached = self.eval_tt.get(hash_val)
+        if cached is not None:
+            return cached
+        val = self.evaluate_board(board, turn)
+        if len(self.eval_tt) > self.EVAL_TT_MAX_SIZE:
+            # Refcount drops to 0 instantly. Python reuses this memory for new entries!
+            self.eval_tt = {}
+        self.eval_tt[hash_val] = val
+        return val
+
+    def _store_tt(self, hash_val, score, depth, flag, move):
+        existing = self.tt.get(hash_val)
+        if len(self.tt) > self.TT_MAX_SIZE:
+            self.tt = {}   # <--- INSTANT MEMORY RELEASE
+            existing = None
+            
+        # Age-based replacement: Overwrite if slot is empty, from an older turn, or searched deeper
+        if not existing or existing.age < self.current_age or depth >= existing.depth:
+            best_move = move if move is not None else (existing.best_move if existing else None)
+            self.tt[hash_val] = TTEntry(score, depth, flag, best_move, self.current_age)
+
+    def _report_log(self, message):   self.comm_queue.put(('log', message))
+    def _report_eval(self, score, depth): self.comm_queue.put(('eval', score if self.color == 'white' else -score, depth))
+    def _report_move(self, move):     self.comm_queue.put(('move', move))
+
+    def _calc_time_check_mask(self, allocated):
+        return calc_time_check_mask(allocated)
+
+    def _search_time_budget(self, time_left, increment):
+        """Split the clock into an 'optimum' soft budget (banked if unused)
+        and a 'max' hard ceiling. See TIME_* constants above for why this
+        stays a local, independently-tunable copy."""
+        buffer = max(self.TIME_BUFFER_SEC, time_left * self.TIME_BUFFER_PCT, increment * 1.5)
+        clock_ceiling = max(0.0, time_left - buffer)
+
+        buffer_health = max(0.0, min(1.0, clock_ceiling / time_left)) if time_left > 0 else 0.0
+
+        divisor = self.TIME_DIVISOR_BASE - (self.TIME_DIVISOR_HEALTH_WEIGHT * buffer_health)
+        optimum_time = (time_left / divisor) + (increment * self.TIME_INCREMENT_WEIGHT)
+        optimum_time = max(self.MIN_MOVE_TIME, optimum_time)
+        optimum_time = min(optimum_time, clock_ceiling)
+
+        max_time = min(clock_ceiling, optimum_time * self.TIME_MAX_MULTIPLIER)
+        max_time = max(max_time, min(self.MIN_MOVE_TIME, clock_ceiling))
+        return optimum_time, max_time
+
+    def _format_move(self, board_before, move):
+        return format_bot_move(self, board_before, move)
+
+    def _is_opening_position(self, board):
+        return (len(board.white_pieces) + len(board.black_pieces)) >= self.OPENING_TOTAL_PIECE_THRESHOLD
+
+    def _opening_development_bonus(self, move, moving_piece):
+        if moving_piece is None: return 0
+        (fr, fc), (tr, tc) = move
+        from_center = abs(fr - 3.5) + abs(fc - 3.5)
+        to_center   = abs(tr - 3.5) + abs(tc - 3.5)
+        center_delta = from_center - to_center
+        bonus = 0
+        if type(moving_piece) is Knight:
+            bonus += int(center_delta * self.OPENING_KNIGHT_CENTER_WEIGHT)
+            if (moving_piece.color == 'white' and fr == ROWS - 1) or (moving_piece.color == 'black' and fr == 0):
+                bonus += self.OPENING_KNIGHT_DEVELOP_BONUS
+            return bonus
+        if type(moving_piece) is Pawn:
+            bonus += int(center_delta * self.OPENING_PAWN_CENTER_WEIGHT)
+            if tc in self.OPENING_CENTRAL_FILES:
+                bonus += self.OPENING_CENTER_PAWN_BONUS
+            return bonus
+        return 0
+
+    def _get_root_tb_eval_relative(self):
+        return None
+
+    def _get_best_tablebase_move_with_eval(self):
+        return None, None
+
+    def _run_depth_iteration(self, depth, root_moves, root_hash, pv_move,
+                             prev_iter_score=None, alpha_floor=None):
+        iter_nodes       = 0
+        iter_tb_hits     = 0
+        any_heuristic_eval = False
+        use_aspiration   = (alpha_floor is None and prev_iter_score is not None and depth >= 2)
+
+        if use_aspiration:
+            window      = self.ASP_WINDOW_INIT
+            alpha_bound = prev_iter_score - window
+            beta_bound  = prev_iter_score + window
+            retries     = 0
+            while True:
+                best_score, best_move = self._search_at_depth(
+                    depth, root_moves, root_hash, pv_move,
+                    aspiration_window=(alpha_bound, beta_bound))
+                iter_nodes   += self.nodes_searched
+                iter_tb_hits += self.tb_hits
+                if self.used_heuristic_eval: any_heuristic_eval = True
+
+                if self.cancellation_event.is_set() or (self.stop_time and time.time() > self.stop_time):
+                    raise SearchCancelledException()
+
+                if best_score <= alpha_bound:
+                    alpha_bound -= window; window *= 2; retries += 1
+                elif best_score >= beta_bound:
+                    beta_bound  += window; window *= 2; retries += 1
+                else:
+                    break
+
+                if retries >= self.ASP_MAX_RETRIES:
+                    best_score, best_move = self._search_at_depth(
+                        depth, root_moves, root_hash, pv_move, alpha_floor=alpha_floor)
+                    iter_nodes   += self.nodes_searched
+                    iter_tb_hits += self.tb_hits
+                    if self.used_heuristic_eval: any_heuristic_eval = True
+                    break
+        else:
+            best_score, best_move = self._search_at_depth(
+                depth, root_moves, root_hash, pv_move, alpha_floor=alpha_floor)
+            iter_nodes       = self.nodes_searched
+            iter_tb_hits     = self.tb_hits
+            if self.used_heuristic_eval: any_heuristic_eval = True
+
+        self.nodes_searched    = iter_nodes
+        self.tb_hits           = iter_tb_hits
+        self.used_heuristic_eval = any_heuristic_eval
+        return best_score, best_move
+
+    def _age_history_table(self):
+        # Gentle 12.5% decay per turn (* 7 // 8) instead of aggressive 50% halving.
+        # Continuation history naturally bounds itself, so we skip the massive Python loop overhead.
+        # List comprehension avoids repeated ht[from_sq][to_sq] double-indexing.
+        for c_idx in range(2):
+            ht = self.history_heuristic_table[c_idx]
+            for from_sq in range(64):
+                row = ht[from_sq]
+                ht[from_sq] = [(v * 7) // 8 for v in row]
+
+    def _get_pv_data(self, max_depth, root_move):
+        return get_pv_data(self, max_depth, root_move)
+
+    def _report_root_tb_solution(self, tb_move, tb_eval, perfect_play=False, emit_move=False):
+        return False
+
+    def make_move(self):
+        try:
+            self._age_history_table()
+
+            # 1. Check Opening Book
+            if self.use_opening_book and self.ply_count <= 16:
+                fen = board_to_fen(self.board, self.color)
+                if fen in OPENING_BOOK:
+                    book_options = OPENING_BOOK[fen]
+                    weights = [opt["weight"] for opt in book_options]
+                    chosen = random.choices(book_options, weights=weights, k=1)[0]
+                    move_tuple = (tuple(chosen["move"][0]), tuple(chosen["move"][1]))
+                    abs_score = chosen['score']
+                    rel_score = abs_score if self.color == 'white' else -abs_score
+                    self._report_log(f"  > {self.bot_name} (Book): {chosen['san']}")
+                    self._report_eval(rel_score, "Book")
+                    self.comm_queue.put(('pv', abs_score, "Book", [chosen['san']], [move_tuple]))
+                    self._report_move(move_tuple)
+                    return
+
+            root_moves = get_all_legal_moves(self.board, self.color)
+            if not root_moves:
+                self._report_move(None)
+                return
+
+            if len(root_moves) == 1:
+                self._report_log(f"  > {self.bot_name} (Forced): {self._format_move(self.board, root_moves[0])}")
+                self.comm_queue.put(('pv', 0, "Forced", [self._format_move(self.board, root_moves[0])], [root_moves[0]]))
+                self._report_move(root_moves[0])
+                return
+
+            best_move_overall  = root_moves[0]
+            prev_iter_score    = None
+            prev_iter_duration = None
+            total_nodes        = 0
+            root_hash          = board_hash(self.board, self.color)
+
+            search_start_time = time.time()
+            if self.time_left is not None and self.increment is not None:
+                optimum_time, max_time = self._search_time_budget(self.time_left, self.increment)
+                self.stop_time = search_start_time + max_time
+                target_depth = 64
+            else:
+                self.stop_time = None
+                optimum_time = float('inf')
+                max_time = float('inf')
+                target_depth = self.search_depth
+
+            for current_depth in range(1, target_depth + 1):
+                iter_start_time = time.time()
+                best_score_this_iter, best_move_this_iter = self._run_depth_iteration(
+                    current_depth, root_moves, root_hash, best_move_overall, prev_iter_score=prev_iter_score)
+
+                if self.cancellation_event.is_set():
+                    raise SearchCancelledException()
+
+                if self.stop_time and time.time() > self.stop_time:
+                    best_move_overall = best_move_this_iter
+                    break
+
+                best_move_overall = best_move_this_iter
+                prev_iter_score   = best_score_this_iter
+                total_nodes      += self.nodes_searched
+                iter_duration     = time.time() - iter_start_time
+                knps              = (self.nodes_searched / iter_duration / 1000) if iter_duration > 0 else 0
+
+                eval_for_ui = best_score_this_iter if self.color == 'white' else -best_score_this_iter
+                tt_str = f", TT={int((len(self.tt) / self.TT_MAX_SIZE) * 1000)}/1000" if getattr(self, 'show_tt_fullness', False) else ""
+                self._report_log(f"  > {self.bot_name} (D{current_depth}): {self._format_move(self.board, best_move_this_iter)}, Eval={eval_for_ui/100:+.2f}, NodesTotal={total_nodes}, KNPS={knps:.1f}{tt_str}, Time={iter_duration:.2f}s")
+                self._report_eval(best_score_this_iter, current_depth)
+
+                pv_str, pv_raw = self._get_pv_data(current_depth, best_move_this_iter)
+                self.comm_queue.put(('pv', eval_for_ui, current_depth, pv_str, pv_raw))
+
+                if best_score_this_iter > self.MATE_SCORE - 2000: break
+
+                if self.stop_time:
+                    time_used = time.time() - search_start_time
+                    if time_used > optimum_time:
+                        break
+
+                    if prev_iter_duration and prev_iter_duration > 0:
+                        effective_branching = iter_duration / prev_iter_duration
+                        effective_branching = max(1.5, min(effective_branching, 6.0))
+                    else:
+                        effective_branching = 4.0
+
+                    predicted_next_duration = iter_duration * effective_branching
+                    time_remaining_to_max   = self.stop_time - time.time()
+
+                    if predicted_next_duration > time_remaining_to_max * 0.85:
+                        break
+
+                prev_iter_duration = iter_duration
+
+            self._report_move(best_move_overall)
+        except SearchCancelledException:
+            if self.cancellation_event.is_set():
+                self._report_move(None)
+            else:
+                self._report_move(best_move_overall)
+
+    def ponder_indefinitely(self):
+        try:
+            self._age_history_table()
+            if is_insufficient_material(self.board): return
+
+            root_moves = get_all_legal_moves(self.board, self.color)
+            if not root_moves: return
+
+            best_move_overall = root_moves[0]
+            root_hash         = board_hash(self.board, self.color)
+            prev_iter_score   = None
+            total_nodes       = 0
+
+            for current_depth in range(1, 100):
+                if self.cancellation_event.is_set(): raise SearchCancelledException()
+                iter_start_time = time.time()
+                best_score_this_iter, best_move_this_iter = self._run_depth_iteration(
+                    current_depth, root_moves, root_hash, best_move_overall,
+                    prev_iter_score=prev_iter_score)
+
+                if not self.cancellation_event.is_set():
+                    best_move_overall = best_move_this_iter
+                    prev_iter_score   = best_score_this_iter
+                    total_nodes      += self.nodes_searched
+                    iter_duration     = time.time() - iter_start_time
+                    knps              = (self.nodes_searched / iter_duration / 1000) if iter_duration > 0 else 0
+
+                    eval_for_ui = best_score_this_iter if self.color == 'white' else -best_score_this_iter
+                    tt_str = f", TT={int((len(self.tt) / self.TT_MAX_SIZE) * 1000)}/1000" if getattr(self, 'show_tt_fullness', False) else ""
+                    self._report_log(f"  > {self.bot_name} (D{current_depth}): {self._format_move(self.board, best_move_this_iter)}, Eval={eval_for_ui/100:+.2f}, NodesTotal={total_nodes}, KNPS={knps:.1f}{tt_str}, Time={iter_duration:.2f}s")
+                    self._report_eval(best_score_this_iter, current_depth)
+
+                    pv_str, pv_raw = self._get_pv_data(current_depth, best_move_this_iter)
+                    self.comm_queue.put(('pv', eval_for_ui, current_depth, pv_str, pv_raw))
+                else:
+                    raise SearchCancelledException()
+        except SearchCancelledException:
+            pass
+
+    def _search_at_depth(self, depth, root_moves, root_hash, pv_move, alpha_floor=None, aspiration_window=None):
+        self.nodes_searched    = 0
+        self.used_heuristic_eval = False
+        self.tb_hits           = 0
+
+        if alpha_floor is not None:
+            best_score_this_iter  = alpha_floor
+            best_move_this_iter   = pv_move if pv_move in root_moves else (root_moves[0] if root_moves else None)
+            alpha = alpha_floor
+            beta  = float('inf')
+        elif aspiration_window is not None:
+            best_score_this_iter, best_move_this_iter = -float('inf'), None
+            alpha, beta = aspiration_window
+        else:
+            best_score_this_iter, best_move_this_iter = -float('inf'), None
+            alpha = -float('inf')
+            beta  =  float('inf')
+
+        ordered_root_moves = self.order_moves(self.board, root_moves, 0, pv_move, self.color)
+        board = self.board
+
+        for move in ordered_root_moves:
+            if self.cancellation_event.is_set(): raise SearchCancelledException()
+
+            record     = board.make_move_track(move[0], move[1])
+            child_hash = incremental_hash(root_hash, record)
+
+            search_path = {root_hash}
+            try:
+                mp = record[2]
+                next_prev_tuple = (move, mp.z_idx)
+
+                if alpha_floor is not None:
+                    probe_score = -self.negamax(
+                        board, depth - 1, -(alpha_floor + 1), -alpha_floor,
+                        self.opponent_color, 1, search_path,
+                        current_hash=child_hash, prev_move_tuple=next_prev_tuple)
+                    if probe_score <= alpha_floor:
+                        continue
+                    score = -self.negamax(
+                        board, depth - 1, -beta, -alpha,
+                        self.opponent_color, 1, search_path,
+                        current_hash=child_hash, prev_move_tuple=next_prev_tuple)
+                else:
+                    score = -self.negamax(
+                        board, depth - 1, -beta, -alpha,
+                        self.opponent_color, 1, search_path,
+                        current_hash=child_hash, prev_move_tuple=next_prev_tuple)
+            finally:
+                board.unmake_move(record)
+
+            if score > best_score_this_iter:
+                best_score_this_iter = score
+                best_move_this_iter  = move
+            if best_score_this_iter > alpha:
+                alpha = best_score_this_iter
+
+        return best_score_this_iter, best_move_this_iter
+
+    def negamax(self, board, depth, alpha, beta, turn, ply, search_path, current_hash=None, prev_move_tuple=None, extensions=0):
+        self.nodes_searched += 1
+        if (self.nodes_searched & self.time_check_mask) == 0:
+            if self.cancellation_event.is_set() or (self.stop_time and time.time() > self.stop_time):
+                raise SearchCancelledException()
+
+        total_pieces = len(board.white_pieces) + len(board.black_pieces)
+
+        hash_val = current_hash if current_hash is not None else board_hash(board, turn)
+        if ply > 0:
+            if hash_val in self.position_counts:
+                return self.DRAW_SCORE
+            if hash_val in search_path:
+                return self.DRAW_SCORE
+
+        if is_insufficient_material(board) or board.halfmove_clock >= 100 or self.ply_count + ply >= self.max_moves:
+            return self.DRAW_SCORE
+
+        original_alpha = alpha
+        tt_entry = self.tt.get(hash_val)
+        # NOTE (v127.1): the old "stale TT repetition guard" that used to sit
+        # here existed only to cover position_counts == 1 nodes; those now
+        # return DRAW_SCORE above before the TT is ever consulted, so the
+        # guard became unreachable dead code and has been removed.
+
+        if ply > 0 and tt_entry and tt_entry.depth >= depth:
+            tt_score = tt_entry.score
+            if tt_score >  self.MATE_SCORE - 1000: tt_score -= ply
+            elif tt_score < -self.MATE_SCORE + 1000: tt_score += ply
+
+            self.used_heuristic_eval = True
+
+            if tt_entry.flag == TT_FLAG_EXACT:
+                return tt_score
+            elif tt_entry.flag == TT_FLAG_LOWERBOUND:
+                if tt_score > alpha: alpha = tt_score
+            elif tt_entry.flag == TT_FLAG_UPPERBOUND:
+                if tt_score < beta: beta = tt_score
+            if alpha >= beta: return tt_score
+
+        if depth <= 0: return self.qsearch(board, alpha, beta, turn, ply, current_hash=hash_val)
+
+        opponent_turn    = 'black' if turn == 'white' else 'white'
+        is_in_check_flag = is_in_check(board, turn)
+        static_eval      = None
+
+        # --- CHECK EXTENSION with absolute ceiling ---
+        if is_in_check_flag and ply < self.MAX_EXTENSION_DEPTH:
+            depth      += 1
+            extensions += 1 # Currently unused, just keep cos I cant be bothered removing it
+
+        path_added = False
+        if hash_val not in search_path:
+            search_path.add(hash_val)
+            path_added = True
+
+        try:
+            # --- LAZY REVERSE FUTILITY PRUNING (Python-Optimized) ---
+            # Instead of calling evaluate_board() and tanking KNPS, we ONLY prune
+            # if the static eval was already computed and cached in the TT.
+            # This provides the Elo benefits of RFP at literally zero CPU cost.
+            if (self.USE_REVERSE_FUTILITY_PRUNING and depth <= self.RFP_MAX_DEPTH and
+                    not is_in_check_flag and ply > 0 and abs(beta) < self.MATE_SCORE - 1000
+                    and total_pieces > 6):
+                static_eval = self.eval_tt.get(hash_val)
+                if static_eval is not None:
+                    rfp_margin = self.RFP_MARGIN_PER_DEPTH * depth
+                    if static_eval - rfp_margin >= beta:
+                        return static_eval - rfp_margin
+
+            if (self.USE_NULL_MOVE_PRUNING and depth >= self.NMP_MIN_DEPTH and
+                    ply > 0 and not is_in_check_flag and abs(beta) < self.MATE_SCORE - 1000
+                    and total_pieces > 6): # Disabled in endgame to prevent zugzwang blind spots
+                pc = board.piece_counts_z
+                if (pc['white'][1] + pc['white'][2] + pc['white'][3] + pc['white'][4] > 0 and
+                        pc['black'][1] + pc['black'][2] + pc['black'][3] + pc['black'][4] > 0):
+                    self.used_heuristic_eval = True
+                    if static_eval is None:
+                        static_eval = self._get_cached_static_eval(board, turn, hash_val)
+                    if static_eval >= beta:
+                        reduction  = self.NMP_BASE_REDUCTION + (depth // self.NMP_DEPTH_DIVISOR)
+                        null_hash  = hash_val ^ ZOBRIST_TURN
+                        score = -self.negamax(board, depth - 1 - reduction, -beta, -beta + 1,
+                                            opponent_turn, ply + 1, search_path,
+                                            null_hash, None, extensions)
+                        if score >= beta: 
+                            # Fail-soft return, but clamp false mate scores
+                            # (skipping a turn creates hallucinated mate distances)
+                            return score if score < self.MATE_SCORE - 1000 else beta
+
+            # --- FORWARD FUTILITY PRUNING (Original Conservative Version) ---
+            futility_prune = False
+            if (self.USE_FUTILITY_PRUNING and depth == 1 and not is_in_check_flag and
+                    abs(alpha) < self.MATE_SCORE - 1000 and total_pieces > 6): # Disabled in endgame
+                self.used_heuristic_eval = True
+                if static_eval is None:
+                    static_eval = self._get_cached_static_eval(board, turn, hash_val)
+                if static_eval + self.FUTILITY_MARGIN < alpha:
+                    futility_prune = True
+
+            pseudo_moves = get_all_pseudo_legal_moves(board, turn)
+            hash_move    = tt_entry.best_move if tt_entry else None
+            
+            # --- INTERNAL ITERATIVE REDUCTION (IIR) ---
+            # If we don't have a TT move to guide us, move ordering will be suboptimal.
+            # We artificially reduce the depth to do a cheaper "reconnaissance" search.
+            # This fills the TT with a good hash move for when the node is inevitably re-searched.
+            if self.USE_IIR and depth >= self.IIR_MIN_DEPTH and not hash_move and not is_in_check_flag:
+                depth -= 1
+            
+            if prev_move_tuple:
+                (pr1, pc1), (pr2, pc2) = prev_move_tuple[0]
+                c_move = self.counter_moves[0 if turn == 'white' else 1][pr1 * 8 + pc1][pr2 * 8 + pc2]
+            else:
+                c_move = None
+
+            ordered_entries = self.order_moves(board, pseudo_moves, ply, hash_move, turn,
+                                            return_meta=True, counter_move=c_move, prev_move_tuple=prev_move_tuple)
+            best_move_for_node = None
+            legal_moves_count  = 0
+            quiet_moves_tried  = []
+            history_table      = self.history_heuristic_table[0 if turn == 'white' else 1]
+            best_score         = -float('inf')
+
+            for move, meta in ordered_entries:
+                is_good_tactic, moving_piece = meta
+                f_sq = move[0][0] * 8 + move[0][1]
+                t_sq = move[1][0] * 8 + move[1][1]
+
+                record     = board.make_move_track(move[0], move[1])
+                child_hash = incremental_hash(hash_val, record)
+
+                own_king_in_check = is_in_check(board, turn)
+
+                if own_king_in_check:
+                    board.unmake_move(record)
+                    continue
+
+                legal_moves_count += 1
+                if not is_good_tactic: quiet_moves_tried.append((move, moving_piece))
+
+                if futility_prune and not is_good_tactic and legal_moves_count > 1:
+                    # SAFETY GUARD: Never prune a quiet move that delivers check.
+                    # Thanks to the highly optimized is_square_attacked in GameLogic,
+                    # this check is now fast enough to run here without tanking NPS.
+                    if not is_in_check(board, opponent_turn):
+                        board.unmake_move(record)
+                        continue
+
+                # --- LATE MOVE REDUCTION ---
+                reduction = 0
+                if (depth >= self.LMR_DEPTH_THRESHOLD and
+                        legal_moves_count > self.LMR_MOVE_COUNT_THRESHOLD and
+                        not is_in_check_flag and not is_good_tactic):
+                    reduction = 1 + (depth // 6) + (legal_moves_count // 12)
+
+                    if (ply < len(self.killer_moves) and move in self.killer_moves[ply]) or move == c_move:
+                        reduction -= 1
+                        
+                    if history_table[f_sq][t_sq] > 250_000:
+                        reduction -= 1
+                        
+                    reduction = max(0, min(reduction, depth - 2))
+
+                search_depth_child = depth - 1 - reduction
+
+                next_prev_tuple = (move, moving_piece.z_idx)
+
+                if legal_moves_count == 1:
+                    score = -self.negamax(board, search_depth_child, -beta, -alpha,
+                                        opponent_turn, ply + 1, search_path, child_hash, next_prev_tuple, extensions)
+                else: # Principal Variation Search (PVS)
+                    score = -self.negamax(board, search_depth_child, -(alpha + 1), -alpha,
+                                        opponent_turn, ply + 1, search_path, child_hash, next_prev_tuple, extensions)
+                    if score > alpha:
+                        if reduction > 0 or score < beta:
+                            score = -self.negamax(board, depth - 1, -beta, -alpha,
+                                                opponent_turn, ply + 1, search_path, child_hash, next_prev_tuple, extensions)
+
+                board.unmake_move(record)
+
+                if score > best_score:
+                    best_score = score
+                    if score > alpha:
+                        alpha, best_move_for_node = score, move
+
+                if best_score >= beta:
+                    if not is_good_tactic:
+                        if ply < len(self.killer_moves) and self.killer_moves[ply][0] != move:
+                            self.killer_moves[ply][1], self.killer_moves[ply][0] = \
+                                self.killer_moves[ply][0], move
+                        if prev_move_tuple:
+                            (pr1, pc1), (pr2, pc2) = prev_move_tuple[0]
+                            self.counter_moves[0 if turn == 'white' else 1][pr1 * 8 + pc1][pr2 * 8 + pc2] = move
+                        
+                        # --- CALIBRATED HISTORY UPDATES ---
+                        if moving_piece:
+                            c_idx = 0 if turn == 'white' else 1
+                            bonus = depth * depth
+                            ht    = self.history_heuristic_table[c_idx]
+                            
+                            # Gravity update for the successful move
+                            ht[f_sq][t_sq] += bonus - (ht[f_sq][t_sq] * bonus) // 2_000_000
+                            
+                            # --- FIXED: Update Continuation History ---
+                            if prev_move_tuple:
+                                prev_move, prev_pt_idx = prev_move_tuple
+                                pr, pc = prev_move[1]
+                                prev_to_sq  = pr * 8 + pc
+                                mp_idx      = moving_piece.z_idx
+                                
+                                ch_table = self.continuation_history[c_idx][prev_pt_idx][prev_to_sq][mp_idx]
+                                ch_table[t_sq] += bonus - (ch_table[t_sq] * bonus) // 64_000
+                            
+                            # Gravity penalty for the failed quiet moves
+                            for f_move, f_mp in quiet_moves_tried:
+                                if f_move != move:
+                                    (fr1, fc1), (fr2, fc2) = f_move
+                                    ff = fr1 * 8 + fc1
+                                    ft = fr2 * 8 + fc2
+                                    ht[ff][ft] -= bonus + (ht[ff][ft] * bonus) // 2_000_000
+                                    
+                                    if prev_move_tuple:
+                                        prev_move, prev_pt_idx = prev_move_tuple
+                                        pr, pc = prev_move[1]
+                                        prev_to_sq = pr * 8 + pc
+                                        f_mp_idx = f_mp.z_idx
+                                        ch_table = self.continuation_history[c_idx][prev_pt_idx][prev_to_sq][f_mp_idx]
+                                        ch_table[ft] -= bonus + (ch_table[ft] * bonus) // 64_000
+
+                    sto = best_score
+                    if sto >  self.MATE_SCORE - 1000: sto = best_score + ply
+                    elif sto < -self.MATE_SCORE + 1000: sto = best_score - ply
+                    self._store_tt(hash_val, sto, depth, TT_FLAG_LOWERBOUND, move)
+                    return best_score
+
+            if legal_moves_count == 0:
+                return -self.MATE_SCORE + ply
+
+            sto = best_score
+            if sto >  self.MATE_SCORE - 1000: sto = best_score + ply
+            elif sto < -self.MATE_SCORE + 1000: sto = best_score - ply
+            flag = TT_FLAG_EXACT if best_score > original_alpha else TT_FLAG_UPPERBOUND
+            self._store_tt(hash_val, sto, depth, flag, best_move_for_node)
+            return best_score
+
+        finally:
+            if path_added: search_path.discard(hash_val)
+
+
+    def qsearch(self, board, alpha, beta, turn, ply, current_hash=None):
+        self.nodes_searched += 1
+        if (self.nodes_searched & self.time_check_mask) == 0:
+            if self.cancellation_event.is_set() or (self.stop_time and time.time() > self.stop_time):
+                raise SearchCancelledException()
+
+        hash_val = current_hash if current_hash is not None else board_hash(board, turn)
+        if ply > 0 and hash_val in self.position_counts:
+            return self.DRAW_SCORE
+
+        tt_entry = self.tt.get(hash_val)
+        if tt_entry:
+            tt_score = tt_entry.score
+            if tt_score > self.MATE_SCORE - 1000: tt_score -= ply
+            elif tt_score < -self.MATE_SCORE + 1000: tt_score += ply
+            if tt_entry.flag == TT_FLAG_EXACT: return tt_score
+            if tt_entry.flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
+            if tt_entry.flag == TT_FLAG_UPPERBOUND and tt_score <= alpha: return tt_score
+
+        if is_insufficient_material(board): return self.DRAW_SCORE
+
+        if ply >= self.MAX_Q_SEARCH_DEPTH:
+            self.used_heuristic_eval = True
+            return self._get_cached_static_eval(board, turn, hash_val)
+
+        self.used_heuristic_eval = True
+        is_in_check_flag = is_in_check(board, turn)
+        best_score = -float('inf')
+
+        if not is_in_check_flag:
+            stand_pat = self._get_cached_static_eval(board, turn, hash_val)
+            best_score = stand_pat
+            if stand_pat >= beta: return stand_pat
+            if stand_pat > alpha: alpha = stand_pat
+
+        promising_moves = get_all_pseudo_legal_moves(board, turn)
+        scored_moves = []
+        grid = board.grid
+        tt_move = tt_entry.best_move if tt_entry else None
+        opponent_turn = 'black' if turn == 'white' else 'white'
+
+        for move in promising_moves:
+            (r1, c1), (r2, c2) = move
+            moving_piece = grid[r1][c1]
+            target_piece = grid[r2][c2]
+
+            swing, is_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+
+            if not is_in_check_flag:
+                if not is_tactic: continue
+                if stand_pat + swing + 200 < alpha: continue
+
+            score = swing * 10 - moving_piece.z_idx
+            if move == tt_move: score += 1_000_000
+            scored_moves.append((score, move))
+
+        scored_moves.sort(key=itemgetter(0), reverse=True)
+        legal_moves_count = 0
+
+        for score, move in scored_moves:
+            record = board.make_move_track(move[0], move[1])
+
+            if is_in_check(board, turn):
+                board.unmake_move(record)
+                continue
+
+            legal_moves_count += 1
+            child_hash = incremental_hash(hash_val, record)
+            search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
+            board.unmake_move(record)
+
+            if search_score > best_score:
+                best_score = search_score
+                if search_score > alpha: alpha = search_score
+            if best_score >= beta: return best_score
+
+        if legal_moves_count == 0 and is_in_check_flag:
+            return -self.MATE_SCORE + ply
+
+        return best_score
+
+    def order_moves(self, board, moves, ply, hash_move, turn, return_meta=False, counter_move=None, prev_move_tuple=None):
+        if not moves: return []
+        scored_moves = []
+        killers = self.killer_moves[ply] if ply < len(self.killer_moves) else [None, None]
+        c_idx = 0 if turn == 'white' else 1
+        history_table = self.history_heuristic_table[c_idx]
+
+        grid = board.grid
+        k1 = killers[0] if killers else None
+        k2 = killers[1] if killers else None
+
+        for move in moves:
+            (r1, c1), (r2, c2) = move
+            moving_piece = grid[r1][c1]
+            target_piece = grid[r2][c2]
+
+            swing, is_good_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+
+            if move == hash_move:
+                score = self.BONUS_PV_MOVE
+            elif is_good_tactic:
+                score = self.BONUS_CAPTURE + (swing * 100) - moving_piece.z_idx
+            elif move == k1:
+                score = 4_000_000
+            elif move == k2:
+                score = 3_000_000
+            elif move == counter_move:
+                score = 2_000_000
+            else:
+                score = history_table[r1 * 8 + c1][r2 * 8 + c2]
+
+            scored_moves.append((score, move, is_good_tactic, moving_piece))
+
+        scored_moves.sort(key=itemgetter(0), reverse=True)
+
+        if return_meta:
+            return [(item[1], (item[2], item[3])) for item in scored_moves]
+        else:
+            return [item[1] for item in scored_moves]
+
+    def evaluate_board(self, board, turn_to_move):
+        if is_insufficient_material(board):
+            return self.DRAW_SCORE
+
+        pc_wz = board.piece_counts_z['white']
+        pc_bz = board.piece_counts_z['black']
+
+        scores_mg = [0, 0]
+        scores_eg = [0, 0]
+
+        phase_material_score = (
+            (pc_wz[1] + pc_bz[1]) * MG_PIECE_VALUES[Knight] +
+            (pc_wz[2] + pc_bz[2]) * MG_PIECE_VALUES[Bishop] +
+            (pc_wz[3] + pc_bz[3]) * MG_PIECE_VALUES[Rook] +
+            (pc_wz[4] + pc_bz[4]) * MG_PIECE_VALUES[Queen]
+        )
+
+        piece_lists = [board.white_pieces, board.black_pieces]
+
+        for color_idx in (0, 1):
+            pieces   = piece_lists[color_idx]
+            is_white = (color_idx == 0)
+            pst_mg   = FLAT_PST_MG_WHITE if is_white else FLAT_PST_MG_BLACK
+            pst_eg   = FLAT_PST_EG_WHITE if is_white else FLAT_PST_EG_BLACK
+
+            for piece in pieces:
+                z    = piece.z_idx
+                r, c = piece.pos
+                sq   = r * 8 + c
+
+                scores_mg[color_idx] += pst_mg[z][sq]
+                scores_eg[color_idx] += pst_eg[z][sq]
+
+            if board.piece_counts_z['white' if is_white else 'black'][2] >= 2:
+                scores_mg[color_idx] += self.EVAL_BISHOP_PAIR
+                scores_eg[color_idx] += self.EVAL_BISHOP_PAIR
+
+        phase     = min(256, (phase_material_score * 256) // INITIAL_PHASE_MATERIAL) if INITIAL_PHASE_MATERIAL > 0 else 0
+        inv_phase = 256 - phase
+
+        mg_score    = scores_mg[0] - scores_mg[1]
+        eg_score    = scores_eg[0] - scores_eg[1]
+        final_score = (mg_score * phase + eg_score * inv_phase) >> 8
+
+        return final_score if turn_to_move == 'white' else -final_score
+
+
+# --- Standard Chess Piece-Square Tables ---
+
+pawn_pst = [
+    [  0,   0,   0,   0,   0,   0,   0,   0],
+    [ 50,  50,  50,  50,  50,  50,  50,  50],
+    [ 10,  10,  20,  30,  30,  20,  10,  10],
+    [  5,   5,  10,  25,  25,  10,   5,   5],
+    [  0,   0,   0,  20,  20,   0,   0,   0],
+    [  5,  -5, -10,   0,   0, -10,  -5,   5],
+    [  5,  10,  10, -20, -20,  10,  10,   5],
+    [  0,   0,   0,   0,   0,   0,   0,   0]
+]
+
+pawn_endgame_pst = [
+    [  0,   0,   0,   0,   0,   0,   0,   0],
+    [ 80,  80,  80,  80,  80,  80,  80,  80],
+    [ 50,  50,  50,  50,  50,  50,  50,  50],
+    [ 30,  30,  30,  35,  35,  30,  30,  30],
+    [ 20,  20,  20,  25,  25,  20,  20,  20],
+    [ 10,  10,  10,  15,  15,  10,  10,  10],
+    [  5,   5,   5,   5,   5,   5,   5,   5],
+    [  0,   0,   0,   0,   0,   0,   0,   0]
+]
+
+knight_pst = [
+    [-50, -40, -30, -30, -30, -30, -40, -50],
+    [-40, -20,   0,   0,   0,   0, -20, -40],
+    [-30,   0,  10,  15,  15,  10,   0, -30],
+    [-30,   5,  15,  20,  20,  15,   5, -30],
+    [-30,   0,  15,  20,  20,  15,   0, -30],
+    [-30,   5,  10,  15,  15,  10,   5, -30],
+    [-40, -20,   0,   5,   5,   0, -20, -40],
+    [-50, -40, -30, -30, -30, -30, -40, -50]
+]
+
+bishop_pst = [
+    [-20, -10, -10, -10, -10, -10, -10, -20],
+    [-10,   0,   0,   0,   0,   0,   0, -10],
+    [-10,   0,   5,  10,  10,   5,   0, -10],
+    [-10,   5,   5,  10,  10,   5,   5, -10],
+    [-10,   0,  10,  10,  10,  10,   0, -10],
+    [-10,  10,  10,  10,  10,  10,  10, -10],
+    [-10,   5,   0,   0,   0,   0,   5, -10],
+    [-20, -10, -10, -10, -10, -10, -10, -20]
+]
+
+rook_pst = [
+    [  0,   0,   0,   0,   0,   0,   0,   0],
+    [  5,  10,  10,  10,  10,  10,  10,   5],
+    [ -5,   0,   0,   0,   0,   0,   0,  -5],
+    [ -5,   0,   0,   0,   0,   0,   0,  -5],
+    [ -5,   0,   0,   0,   0,   0,   0,  -5],
+    [ -5,   0,   0,   0,   0,   0,   0,  -5],
+    [ -5,   0,   0,   0,   0,   0,   0,  -5],
+    [  0,   0,   0,   5,   5,   0,   0,   0]
+]
+
+queen_pst = [
+    [-20, -10, -10,  -5,  -5, -10, -10, -20],
+    [-10,   0,   0,   0,   0,   0,   0, -10],
+    [-10,   0,   5,   5,   5,   5,   0, -10],
+    [ -5,   0,   5,   5,   5,   5,   0,  -5],
+    [  0,   0,   5,   5,   5,   5,   0,  -5],
+    [-10,   5,   5,   5,   5,   5,   0, -10],
+    [-10,   0,   5,   0,   0,   0,   0, -10],
+    [-20, -10, -10,  -5,  -5, -10, -10, -20]
+]
+
+king_midgame_pst = [
+    [-30, -40, -40, -50, -50, -40, -40, -30],
+    [-30, -40, -40, -50, -50, -40, -40, -30],
+    [-30, -40, -40, -50, -50, -40, -40, -30],
+    [-30, -40, -40, -50, -50, -40, -40, -30],
+    [-20, -30, -30, -40, -40, -30, -20, -20],
+    [-10, -20, -20, -20, -20, -20, -20, -10],
+    [ 20,  20,   0,   0,   0,   0,  20,  20],
+    [ 20,  30,  10,   0,   0,  10,  30,  20]
+]
+
+king_endgame_pst = [
+    [-50, -40, -30, -20, -20, -30, -40, -50],
+    [-30, -20, -10,   0,   0, -10, -20, -30],
+    [-30, -10,  20,  30,  30,  20, -10, -30],
+    [-30, -10,  30,  40,  40,  30, -10, -30],
+    [-30, -10,  30,  40,  40,  30, -10, -30],
+    [-30, -10,  20,  30,  30,  20, -10, -30],
+    [-30, -30,   0,   0,   0,   0, -30, -30],
+    [-50, -30, -30, -30, -30, -30, -30, -50]
+]
+
+PIECE_SQUARE_TABLES = {
+    Pawn:           pawn_pst,
+    'pawn_endgame': pawn_endgame_pst,
+    Knight:         knight_pst,
+    Bishop:         bishop_pst,
+    Rook:           rook_pst,
+    Queen:          queen_pst,
+    'king_midgame': king_midgame_pst,
+    'king_endgame': king_endgame_pst,
+}
+
+FLAT_PST_MG_WHITE, FLAT_PST_MG_BLACK, FLAT_PST_EG_WHITE, FLAT_PST_EG_BLACK = build_flat_pst_tables(
+    MG_PIECE_VALUES, EG_PIECE_VALUES, PIECE_SQUARE_TABLES
+)

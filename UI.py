@@ -888,6 +888,48 @@ class EnhancedChessApp:
         self.update_bot_labels()
         self.set_interactivity(True)
 
+    def _get_premove_destinations(self, piece, start_pos):
+        """Returns all geometrically reachable squares for a piece on an open board."""
+        sr, sc = start_pos
+        sq = sr * 8 + sc
+        pz = piece.z_idx
+        dests = []
+
+        if pz == 0:  # Pawn
+            p_dir = -1 if piece.color == 'white' else 1
+            # 1-step forward
+            if 0 <= sr + p_dir < 8:
+                dests.append((sr + p_dir, sc))
+            # 2-steps forward from starting rank
+            if sr == piece.starting_row and 0 <= sr + 2 * p_dir < 8:
+                dests.append((sr + 2 * p_dir, sc))
+            # Diagonal captures / en-passant
+            for dc in (-1, 1):
+                if 0 <= sr + p_dir < 8 and 0 <= sc + dc < 8:
+                    dests.append((sr + p_dir, sc + dc))
+
+        elif pz == 1:  # Knight
+            dests.extend(KNIGHT_ATTACKS_FROM[(sr, sc)])
+
+        elif pz == 2:  # Bishop (all diagonals regardless of blockers)
+            for ray in RAYS_DIAGONAL[sq]:
+                dests.extend(ray)
+
+        elif pz == 3:  # Rook (all orthogonals regardless of blockers)
+            for ray in RAYS_ORTHOGONAL[sq]:
+                dests.extend(ray)
+
+        elif pz == 4:  # Queen (all rays regardless of blockers)
+            for ray in RAYS_ALL[sq]:
+                dests.extend(ray)
+
+        elif pz == 5:  # King (1-step in any direction + castling target squares)
+            dests.extend(KING_ATTACKS_FROM[(sr, sc)])
+            if sc == 4 and (sr == 0 or sr == 7):
+                dests.extend([(sr, 2), (sr, 6)])
+
+        return dests
+
     def on_drag_start(self, event):
         cleared_custom = False
         if self.custom_arrows or self.custom_highlights:
@@ -922,10 +964,12 @@ class EnhancedChessApp:
             self.selected = (r, c)
             self.drag_start = (r, c)
             self.dragging = True
-            # Get valid pseudo-legal movement directions for this piece
+            # Only show dots on currently reachable squares
             all_pseudo = get_all_pseudo_legal_moves(self.board, self.human_color)
-            self.valid_moves = all_pseudo
             self.valid_moves_for_highlight = [e for s, e in all_pseudo if s == self.selected]
+            # But allow dropping anywhere along the piece's full open-board geometry
+            dests = self._get_premove_destinations(piece, (r, c))
+            self.valid_moves = [(self.selected, d) for d in dests]
             self.drag_piece_ghost = self.canvas.create_text(
                 event.x, event.y, text=piece.symbol(),
                 font=("Arial Unicode MS", int(self.square_size * 0.7)),

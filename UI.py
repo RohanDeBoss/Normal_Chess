@@ -1,4 +1,4 @@
-# ChessUI.py (v17.2 - Fix rare visual eval flipping bug)
+# ChessUI.py (v1.1 Added Premoves)
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -69,6 +69,7 @@ class EnhancedChessApp:
         self.drag_piece_ghost = None
         self.drag_start   = None
         self.is_interactive = True
+        self.premove      = None
 
         # --- DRAWING / ARROWS STATE ---
         self.custom_arrows      = set()
@@ -637,6 +638,7 @@ class EnhancedChessApp:
         self.position_counts = {board_hash(self.board, self.turn): 1}
         self.game_over       = False
         self.game_result     = None
+        self.premove         = None
         self.last_eval_score = 0.0
         self.last_eval_depth = None
         self.draw_eval_bar(0)
@@ -862,6 +864,21 @@ class EnhancedChessApp:
             self.board.make_move(the_move[0], the_move[1])
             self.execute_move_and_check_state(self.turn, the_move)
 
+            # Auto-execute premove if legal, otherwise instantly clear visual highlight
+            if not self.game_over and self.game_mode.get() == GameMode.HUMAN_VS_BOT.value and self.turn == self.human_color:
+                if self.premove:
+                    pm = self.premove
+                    self.premove = None
+                    if pm in get_all_legal_moves(self.board, self.turn):
+                        self.board.make_move(pm[0], pm[1])
+                        self.execute_move_and_check_state(self.turn, pm)
+                        if not self.game_over and self.turn != self.human_color:
+                            self.set_interactivity(False)
+                            self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
+                    else:
+                        # Premove became illegal — redraw board immediately so highlight vanishes
+                        self.draw_board()
+
             if not self.game_over and self.game_mode.get() == GameMode.AI_VS_AI.value:
                 self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
         else:
@@ -878,31 +895,47 @@ class EnhancedChessApp:
             self.custom_highlights.clear()
             cleared_custom = True
 
-        if not getattr(self, 'is_interactive', True) or self.game_over:
-            if cleared_custom:
-                self.draw_board()
-            return
+        if self.premove:
+            self.premove = None
+            cleared_custom = True
 
-        if self.is_ai_thinking() and not self.analysis_thinking:
-            if cleared_custom:
-                self.draw_board()
+        if self.game_over:
+            if cleared_custom: self.draw_board()
             return
 
         r, c = self.canvas_to_board(event.x, event.y)
         if r == -1 or not self.board.grid[r][c]:
-            if cleared_custom:
-                self.draw_board()
+            if cleared_custom: self.draw_board()
             return
 
         piece = self.board.grid[r][c]
-        if piece.color != self.turn:
-            if cleared_custom:
-                self.draw_board()
+        mode = self.game_mode.get()
+
+        # Check if this is a premove drag (opponent's turn in Bot mode)
+        is_premove = (mode == GameMode.HUMAN_VS_BOT.value and self.turn != self.human_color) or \
+                     (self.is_ai_thinking() and not self.analysis_thinking)
+
+        if is_premove:
+            if piece.color != self.human_color:
+                if cleared_custom: self.draw_board()
+                return
+            self.selected = (r, c)
+            self.drag_start = (r, c)
+            self.dragging = True
+            # Get valid pseudo-legal movement directions for this piece
+            all_pseudo = get_all_pseudo_legal_moves(self.board, self.human_color)
+            self.valid_moves = all_pseudo
+            self.valid_moves_for_highlight = [e for s, e in all_pseudo if s == self.selected]
+            self.drag_piece_ghost = self.canvas.create_text(
+                event.x, event.y, text=piece.symbol(),
+                font=("Arial Unicode MS", int(self.square_size * 0.7)),
+                fill=piece.color, tags="drag_ghost")
+            self.draw_board()
+            self.canvas.tag_raise("drag_ghost")
             return
-            
-        if self.game_mode.get() == GameMode.HUMAN_VS_BOT.value and self.turn != self.human_color:
-            if cleared_custom:
-                self.draw_board()
+
+        if piece.color != self.turn:
+            if cleared_custom: self.draw_board()
             return
 
         self.selected  = (r, c)
@@ -918,22 +951,14 @@ class EnhancedChessApp:
         self.canvas.tag_raise("drag_ghost")
 
     def on_drag_motion(self, event):
-        if not getattr(self, 'is_interactive', True):
-            return
         if self.dragging:
             self.canvas.coords(self.drag_piece_ghost, event.x, event.y)
 
     def on_drag_end(self, event):
-        if not getattr(self, 'is_interactive', True):
-            return
-            
-        is_analysis = self.is_ai_thinking() and self.analysis_thinking
-        if self.is_ai_thinking() and not is_analysis:
-            self.valid_moves = []
-            self.draw_board()
-            return
         if not self.dragging:
             self.valid_moves = []
+            self.valid_moves_for_highlight = []
+            self.selected = None
             self.draw_board()
             return
             
@@ -941,18 +966,40 @@ class EnhancedChessApp:
         self.canvas.delete("drag_ghost")
         row, col = self.canvas_to_board(event.x, event.y)
         if row == -1 or not self.drag_start:
-            self.update_ui_after_state_change()
-            self.set_interactivity(True)
+            self.drag_start = None
+            self.selected = None
+            self.valid_moves = []
+            self.valid_moves_for_highlight = []
+            self.draw_board()
             return
             
         start_pos, end_pos = self.drag_start, (row, col)
+        mode = self.game_mode.get()
+
+        is_premove = (mode == GameMode.HUMAN_VS_BOT.value and self.turn != self.human_color) or \
+                     (self.is_ai_thinking() and not self.analysis_thinking)
+
+        # Enforce piece movement rules for premoves
+        if is_premove:
+            if (start_pos, end_pos) in self.valid_moves:
+                self.premove = (start_pos, end_pos)
+            self.drag_start = None
+            self.selected = None
+            self.valid_moves = []
+            self.valid_moves_for_highlight = []
+            self.draw_board()
+            return
+
+        # Regular move
         if (start_pos, end_pos) in self.valid_moves:
             self.board.make_move(start_pos, end_pos)
             self.execute_move_and_check_state(self.turn, (start_pos, end_pos))
             if not self.game_over:
-                mode = self.game_mode.get()
                 if mode == GameMode.HUMAN_VS_BOT.value and self.turn != self.human_color:
                     self.drag_start = None
+                    self.selected = None
+                    self.valid_moves = []
+                    self.valid_moves_for_highlight = []
                     self.set_interactivity(False)
                     self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
                     return
@@ -960,11 +1007,17 @@ class EnhancedChessApp:
                     self._update_analysis_after_state_change()
                     
         self.drag_start = None
+        self.selected = None
+        self.valid_moves = []
+        self.valid_moves_for_highlight = []
         self.update_ui_after_state_change()
         self.set_interactivity(True)
 
     # ------------------------------------------------------------------ Right-Click Drawings
     def on_right_click_start(self, event):
+        if self.premove:
+            self.premove = None
+            self.draw_board()
         r, c = self.canvas_to_board(event.x, event.y)
         if r != -1:
             self.rc_start_pos = (r, c)
@@ -1180,12 +1233,32 @@ class EnhancedChessApp:
             self.canvas.create_rectangle(2, 2, w - 2, h - 2, outline=self.COLORS['warning'],
                                          width=4, tags="border_highlight")
                                          
+        # Selected square highlight (instant visual feedback on click/drag)
+        if self.selected:
+            sx, sy = self.board_to_canvas(*self.selected)
+            self.canvas.create_rectangle(
+                sx, sy, sx + self.square_size, sy + self.square_size,
+                fill="#8338ec" if (self.turn != self.human_color and self.game_mode.get() == GameMode.HUMAN_VS_BOT.value) else "#3a86ff",
+                stipple="gray50", outline="", tags="highlight"
+            )
+
+        # Queued premove start and end square highlights
+        if self.premove:
+            for pr, pc in self.premove:
+                px, py = self.board_to_canvas(pr, pc)
+                self.canvas.create_rectangle(
+                    px, py, px + self.square_size, py + self.square_size,
+                    fill="#8338ec", stipple="gray50", outline="#c77dff", width=2, tags="highlight"
+                )
+
+        # Destination dots
+        dot_color = "#8338ec" if (self.turn != self.human_color and self.game_mode.get() == GameMode.HUMAN_VS_BOT.value) else "#1E90FF"
         for r_m, c_m in getattr(self, 'valid_moves_for_highlight', []):
             x1, y1 = self.board_to_canvas(r_m, c_m)
             rd      = self.square_size // 5
             cx, cy  = x1 + self.square_size // 2, y1 + self.square_size // 2
             self.canvas.create_oval(cx - rd, cy - rd, cx + rd, cy + rd,
-                                    fill="#1E90FF", outline="", tags="highlight")
+                                    fill=dot_color, outline="", tags="highlight")
                                     
         for r, c in self.custom_highlights:
             self._draw_highlight(r, c, tags="custom_highlight")

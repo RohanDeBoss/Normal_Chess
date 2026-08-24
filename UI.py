@@ -1,4 +1,4 @@
-# ChessUI.py (v1.1 Added Premoves)
+# ChessUI.py (v1.2 Massive UI overhaul)
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -370,7 +370,8 @@ class EnhancedChessApp:
         for txt, cmd in [("NEW GAME",        self.reset_game),
                          ("SWAP SIDES",      self.swap_sides),
                          ("CLEAR HASH",      self.clear_hash_manually),
-                         ("AI vs OP Series", self.start_ai_series)]:
+                         ("AI vs OP Series", self.start_ai_series),
+                         ("VERIFY PERFT",    self.run_move_checker)]:
             ttk.Button(cf, text=txt, command=cmd, style='Control.TButton').pack(fill=tk.X, pady=3)
         self.flip_view_btn = ttk.Button(cf, text="FLIP VIEW",
                                         command=self.toggle_board_view, style='Control.TButton')
@@ -1034,9 +1035,19 @@ class EnhancedChessApp:
             self.draw_board()
             return
 
-        # Regular move
-        if (start_pos, end_pos) in self.valid_moves:
-            self.board.make_move(start_pos, end_pos)
+        # Regular move (validate against current board state legal moves)
+        current_legal = get_all_legal_moves(self.board, self.turn)
+        if (start_pos, end_pos) in current_legal:
+            promo_cls = self.check_and_prompt_promotion(start_pos, end_pos)
+            if promo_cls is False:  # User cancelled/closed promotion dialog
+                self.drag_start = None
+                self.selected = None
+                self.valid_moves = []
+                self.valid_moves_for_highlight = []
+                self.draw_board()
+                return
+
+            self._apply_move_with_promotion(start_pos, end_pos, promo_cls)
             self.execute_move_and_check_state(self.turn, (start_pos, end_pos))
             if not self.game_over:
                 if mode == GameMode.HUMAN_VS_BOT.value and self.turn != self.human_color:
@@ -1056,6 +1067,116 @@ class EnhancedChessApp:
         self.valid_moves_for_highlight = []
         self.update_ui_after_state_change()
         self.set_interactivity(True)
+
+    # ------------------------------------------------------------------ Promotion & Rules Verification
+    def check_and_prompt_promotion(self, start_pos, end_pos):
+        """Checks if human pawn moved to back rank and requests promotion choice."""
+        piece = self.board.grid[start_pos[0]][start_pos[1]]
+        if isinstance(piece, Pawn):
+            target_rank = 0 if piece.color == "white" else 7
+            if end_pos[0] == target_rank:
+                return self._show_promotion_dialog(piece.color)
+        return None
+
+    def _show_promotion_dialog(self, color):
+        """Displays modal popup to pick Queen, Rook, Bishop, or Knight."""
+        dialog = tk.Toplevel(self.master)
+        dialog.title("Pawn Promotion")
+        dialog.configure(bg=self.COLORS['bg_dark'])
+        dialog.transient(self.master)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        dialog.update_idletasks()
+        dw, dh = 340, 115
+        mx = self.master.winfo_x() + (self.master.winfo_width() - dw) // 2
+        my = self.master.winfo_y() + (self.master.winfo_height() - dh) // 2
+        dialog.geometry(f"{dw}x{dh}+{mx}+{my}")
+
+        ttk.Label(dialog, text="Choose piece to promote to:", style='Header.TLabel').pack(pady=(8, 4))
+
+        promo_frame = ttk.Frame(dialog, style='Left.TFrame')
+        promo_frame.pack(pady=5)
+
+        chosen = [Queen]
+
+        choices = [
+            ("Queen", Queen, "♕" if color == "white" else "♛"),
+            ("Rook", Rook, "♖" if color == "white" else "♜"),
+            ("Bishop", Bishop, "♗" if color == "white" else "♝"),
+            ("Knight", Knight, "♘" if color == "white" else "♞"),
+        ]
+
+        for name, cls, sym in choices:
+            btn = tk.Button(
+                promo_frame, text=f"{sym}\n{name}", font=("Helvetica", 10, "bold"),
+                bg=self.COLORS['bg_light'], fg=self.COLORS['text_light'],
+                activebackground=self.COLORS['accent'], activeforeground="#ffffff",
+                relief="flat", width=6,
+                command=lambda c=cls: [chosen.__setitem__(0, c), dialog.destroy()]
+            )
+            btn.pack(side=tk.LEFT, padx=4)
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: [chosen.__setitem__(0, False), dialog.destroy()])
+        self.master.wait_window(dialog)
+        return chosen[0]
+
+    def _apply_move_with_promotion(self, start_pos, end_pos, promo_cls):
+        """Executes move on board, applying promotion type if selected."""
+        try:
+            self.board.make_move(start_pos, end_pos, promo_cls)
+        except TypeError:
+            self.board.make_move(start_pos, end_pos)
+            if promo_cls:
+                self.board.grid[end_pos[0]][end_pos[1]] = promo_cls(self.turn)
+
+    def run_move_checker(self):
+        """Validates starting position legal move count against standard chess rules."""
+        test_board = Board()
+        d1_moves = get_all_legal_moves(test_board, "white")
+        d1_count = len(d1_moves)
+
+        # Depth 2 Perft calculation (20 x 20 = 400 expected)
+        d2_count = 0
+        for m in d1_moves:
+            b_clone = test_board.clone()
+            b_clone.make_move(m[0], m[1])
+            d2_moves = get_all_legal_moves(b_clone, "black")
+            d2_count += len(d2_moves)
+
+        d1_expected = 20
+        d2_expected = 400
+        d1_pass = (d1_count == d1_expected)
+        d2_pass = (d2_count == d2_expected)
+
+        details = (
+            f"--- START POSITION PERFT CHECK ---\n"
+            f"Depth 1 Legal Moves: {d1_count} (Expected: {d1_expected}) -> {'PASS [OK]' if d1_pass else 'FAIL [MISMATCH]'}\n"
+            f"Depth 2 Legal Moves: {d2_count} (Expected: {d2_expected}) -> {'PASS [OK]' if d2_pass else 'FAIL [MISMATCH]'}\n\n"
+            f"Depth 1 Moves Breakdown ({d1_count} total):\n"
+        )
+        for i, m in enumerate(d1_moves, 1):
+            child = test_board.clone()
+            child.make_move(m[0], m[1])
+            san = format_move_san(test_board, child, m)
+            details += f"  {i:2d}. {san.ljust(6)} ({m[0]} -> {m[1]})\n"
+
+        print("\n" + details)
+        if d1_pass and d2_pass:
+            messagebox.showinfo(
+                "Perft Rules Check Passed",
+                f"Standard Chess Rule Verification: SUCCESS!\n\n"
+                f"Depth 1: {d1_count}/{d1_expected} legal moves\n"
+                f"Depth 2: {d2_count}/{d2_expected} legal moves"
+            )
+        else:
+            messagebox.showerror(
+                "Perft Rules Check Failed",
+                f"MISMATCH DETECTED against standard chess!\n\n"
+                f"Depth 1: {d1_count} (Expected: {d1_expected})\n"
+                f"Depth 2: {d2_count} (Expected: {d2_expected})\n\n"
+                f"See terminal log for details."
+            )
 
     # ------------------------------------------------------------------ Right-Click Drawings
     def on_right_click_start(self, event):
@@ -1198,9 +1319,29 @@ class EnhancedChessApp:
             self._start_ai_process(bot_class, bot_name, self.bot_depth_slider.get())
 
     def update_ui_after_state_change(self):
-        self.selected                  = None
-        self.valid_moves               = []
-        self.valid_moves_for_highlight = []
+        # Preserve active drag state if user is currently holding a piece mid-turn change
+        if self.dragging and self.drag_start:
+            r, c = self.drag_start
+            piece = self.board.grid[r][c]
+            if piece and piece.color == self.turn:
+                # Piece still exists and it is now our turn: update valid moves to current position
+                self.valid_moves = get_all_legal_moves(self.board, self.turn)
+                self.valid_moves_for_highlight = [e for s, e in self.valid_moves if s == self.selected]
+            else:
+                # Piece was captured by the incoming move: cancel drag
+                self.dragging = False
+                self.drag_start = None
+                self.selected = None
+                self.valid_moves = []
+                self.valid_moves_for_highlight = []
+                if self.drag_piece_ghost:
+                    self.canvas.delete("drag_ghost")
+                    self.drag_piece_ghost = None
+        else:
+            self.selected                  = None
+            self.valid_moves               = []
+            self.valid_moves_for_highlight = []
+
         self.custom_arrows.clear()
         self.custom_highlights.clear()
         self.update_turn_label()
@@ -1208,6 +1349,8 @@ class EnhancedChessApp:
         self.update_bot_labels()
         self.update_moves_list()
         self.draw_board()
+        if self.dragging and self.drag_piece_ghost:
+            self.canvas.tag_raise("drag_ghost")
         self.update_navigation_buttons()
 
     def _navigate_history(self, target_index):
@@ -1314,14 +1457,19 @@ class EnhancedChessApp:
                     continue
                 if isinstance(piece, King):
                     is_lost = (self.game_over and self.game_result
-                               and self.game_result[0] == "checkmate"
+                               and self.game_result[0] in ("checkmate", "timeout")
                                and self.game_result[1] != piece.color)
                     clr = "darkred" if is_lost else ("red" if is_in_check(self.board, piece.color) else None)
                     if clr:
                         x1, y1 = self.board_to_canvas(r, c)
-                        self.canvas.create_rectangle(
-                            x1, y1, x1 + self.square_size, y1 + self.square_size,
-                            outline=clr, width=4, tags="check_highlight")
+                        if is_lost:
+                            self.canvas.create_rectangle(
+                                x1, y1, x1 + self.square_size, y1 + self.square_size,
+                                fill="#8B0000", stipple="gray50", outline="#FF0000", width=3, tags="check_highlight")
+                        else:
+                            self.canvas.create_rectangle(
+                                x1, y1, x1 + self.square_size, y1 + self.square_size,
+                                outline=clr, width=4, tags="check_highlight")
                             
                 if (r, c) != self.drag_start:
                     x, y  = self.board_to_canvas(r, c)
@@ -1591,8 +1739,14 @@ class EnhancedChessApp:
                 bg=self.COLORS['accent']     if self.turn == 'black' else self.COLORS['bg_medium'],
                 fg=self.COLORS['text_light'] if self.turn == 'black' else self.COLORS['text_dark'])
         else:
-            self.white_clock_lbl.config(bg=self.COLORS['bg_light'],  fg=self.COLORS['text_light'])
-            self.black_clock_lbl.config(bg=self.COLORS['bg_medium'], fg=self.COLORS['text_light'])
+            is_timeout = (self.game_result and self.game_result[0] == "timeout")
+            timed_out_color = ('white' if self.white_time <= 0 else 'black') if is_timeout else None
+            self.white_clock_lbl.config(
+                bg="#8B0000" if timed_out_color == 'white' else self.COLORS['bg_light'],
+                fg="#FFFFFF" if timed_out_color == 'white' else self.COLORS['text_dark'])
+            self.black_clock_lbl.config(
+                bg="#8B0000" if timed_out_color == 'black' else self.COLORS['bg_medium'],
+                fg="#FFFFFF" if timed_out_color == 'black' else self.COLORS['text_dark'])
 
     def _tick_clock(self):
         if not self.use_clock_var.get() or not self.clock_running or self.game_over:
@@ -1627,10 +1781,25 @@ class EnhancedChessApp:
 
     def update_turn_label(self):
         if self.game_result:
-            res_text = self.game_result[0].upper().replace('_', ' ')
-            self.turn_label.config(text=f"GAME OVER: {res_text}")
+            res, winner = self.game_result
+            if res == "timeout":
+                loser = "White" if winner == "black" else "Black"
+                self.turn_label.config(
+                    text=f"⌛ OUT OF TIME: {loser.upper()} LOST",
+                    background="#8B0000", foreground="#FFFFFF")
+            elif res == "checkmate":
+                self.turn_label.config(
+                    text=f"★ CHECKMATE: {winner.upper()} WINS",
+                    background="#8B0000", foreground="#FFFFFF")
+            else:
+                res_text = res.upper().replace('_', ' ')
+                self.turn_label.config(
+                    text=f"GAME OVER: {res_text}",
+                    background=self.COLORS['bg_light'], foreground=self.COLORS['text_light'])
         else:
-            self.turn_label.config(text=f"TURN: {self.turn.upper()}")
+            self.turn_label.config(
+                text=f"TURN: {self.turn.upper()}",
+                background=self.COLORS['bg_light'], foreground=self.COLORS['text_light'])
 
     def update_bot_labels(self):
         mode = self.game_mode.get()

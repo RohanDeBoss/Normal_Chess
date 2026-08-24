@@ -140,7 +140,6 @@ class Board:
         self.black_king_pos   = None
         self.white_pieces     = []
         self.black_pieces     = []
-        self.pieces_by_z      = {'white': [[] for _ in range(6)], 'black': [[] for _ in range(6)]}
         self.piece_counts_z   = {'white': [0] * 6, 'black': [0] * 6}
         self.castling_rights  = 15  # 1111 binary: WK, WQ, BK, BQ
         self.ep_square        = None
@@ -169,16 +168,11 @@ class Board:
         lst             = self.white_pieces if piece.color == 'white' else self.black_pieces
         piece._list_pos = len(lst)
         lst.append(piece)
-        
-        z_lst             = self.pieces_by_z[piece.color][piece.z_idx]
-        piece._z_list_pos = len(z_lst)
-        z_lst.append(piece)
 
     def _list_remove(self, piece):
         """
         O(1) swap-and-pop removal.  Swaps piece with the last element so the
-        list stays compact, then pops the tail.  Safe to call on a piece that
-        is already absent (_list_pos == -1) — treated as a no-op.
+        list stays compact, then pops the tail.
         """
         idx = piece._list_pos
         if idx < 0:
@@ -189,16 +183,6 @@ class Board:
         last._list_pos = idx
         lst.pop()
         piece._list_pos = -1
-        
-        z_idx = piece._z_list_pos
-        if z_idx >= 0:
-            z_lst = self.pieces_by_z[piece.color][piece.z_idx]
-            if z_lst:
-                z_last = z_lst[-1]
-                z_lst[z_idx] = z_last
-                z_last._z_list_pos = z_idx
-                z_lst.pop()
-            piece._z_list_pos = -1
 
     # ---- Board mutation primitives ----------------------------------------
 
@@ -252,17 +236,6 @@ class Board:
         black_pieces = [_clone_piece_fast(p) for p in self.black_pieces]
         new_board.white_pieces = white_pieces
         new_board.black_pieces = black_pieces
-        new_board.pieces_by_z  = {'white': [[] for _ in range(6)], 'black': [[] for _ in range(6)]}
-        
-        for p in white_pieces:
-            z_lst = new_board.pieces_by_z['white'][p.z_idx]
-            p._z_list_pos = len(z_lst)
-            z_lst.append(p)
-            
-        for p in black_pieces:
-            z_lst = new_board.pieces_by_z['black'][p.z_idx]
-            p._z_list_pos = len(z_lst)
-            z_lst.append(p)
 
         grid = new_board.grid
         for p in white_pieces: r, c = p.pos; grid[r][c] = p
@@ -535,13 +508,27 @@ def has_legal_moves(board, color):
 def is_insufficient_material(board):
     pcz_w = board.piece_counts_z['white']
     pcz_b = board.piece_counts_z['black']
+    # If any pawns, rooks, or queens exist, material is sufficient
     if pcz_w[0] > 0 or pcz_b[0] > 0 or pcz_w[3] > 0 or pcz_b[3] > 0 or pcz_w[4] > 0 or pcz_b[4] > 0:
         return False
-    if len(board.white_pieces) == 1 and len(board.black_pieces) == 1:
+
+    w_count, b_count = len(board.white_pieces), len(board.black_pieces)
+    # K vs K
+    if w_count == 1 and b_count == 1:
         return True
-    if (len(board.white_pieces) <= 2 and len(board.black_pieces) == 1) or \
-       (len(board.black_pieces) <= 2 and len(board.white_pieces) == 1):
+    # K+N vs K or K+B vs K
+    if (w_count <= 2 and b_count == 1) or (b_count <= 2 and w_count == 1):
         return True
+    # K+B vs K+B (same color bishops) or K+N vs K+N / K+B vs K+N
+    if w_count == 2 and b_count == 2:
+        if pcz_w[2] == 1 and pcz_b[2] == 1:
+            w_b_pos = next(p.pos for p in board.white_pieces if p.z_idx == 2)
+            b_b_pos = next(p.pos for p in board.black_pieces if p.z_idx == 2)
+            # Same color square bishops cannot mate
+            if (w_b_pos[0] + w_b_pos[1]) % 2 == (b_b_pos[0] + b_b_pos[1]) % 2:
+                return True
+        elif (pcz_w[1] == 1 and pcz_b[1] == 1) or (pcz_w[2] == 1 and pcz_b[1] == 1) or (pcz_w[1] == 1 and pcz_b[2] == 1):
+            return True
     return False
 
 _board_hash_fn = None
@@ -619,7 +606,9 @@ def format_move_san(board_before, board_after, move):
         if p.z_idx == 0:
             san = f"{files[start_pos[1]]}x{files[end_pos[1]]}{ranks[end_pos[0]]}" if is_cap else f"{files[end_pos[1]]}{ranks[end_pos[0]]}"
             if end_pos[0] == p.promo_rank:
-                san += "=Q"
+                promoted_piece = board_after.grid[end_pos[0]][end_pos[1]]
+                promo_char = chars.get(type(promoted_piece), 'Q') if promoted_piece else 'Q'
+                san += f"={promo_char}"
         else:
             p_char = chars[type(p)]
             same_pieces = [other for other in (board_before.white_pieces if p.color == 'white' else board_before.black_pieces)

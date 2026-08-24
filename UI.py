@@ -948,13 +948,17 @@ class EnhancedChessApp:
             if cleared_custom: self.draw_board()
             return
 
+        mode = self.game_mode.get()
+        if mode == GameMode.AI_VS_AI.value:
+            if cleared_custom: self.draw_board()
+            return
+
         r, c = self.canvas_to_board(event.x, event.y)
         if r == -1 or not self.board.grid[r][c]:
             if cleared_custom: self.draw_board()
             return
 
         piece = self.board.grid[r][c]
-        mode = self.game_mode.get()
 
         # Check if this is a premove drag (opponent's turn in Bot mode)
         is_premove = (mode == GameMode.HUMAN_VS_BOT.value and self.turn != self.human_color) or \

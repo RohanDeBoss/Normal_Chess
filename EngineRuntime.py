@@ -1,6 +1,5 @@
 # EngineRuntime.py (v1.4 - standard chess hashing/FEN, tablebase removed)
 
-import gc
 import glob
 import inspect
 import json
@@ -12,7 +11,7 @@ from collections import namedtuple
 
 from GameLogic import (
     ROWS, COLS, Pawn, Knight, Bishop, Rook, Queen, King,
-    format_move_san, get_all_legal_moves, has_legal_moves, is_insufficient_material,
+    format_move_san, get_all_legal_moves,
 )
 
 OPTIONAL_BOT_KWARGS = (
@@ -109,7 +108,6 @@ def incremental_hash(parent_hash, record_tuple):
             h ^= ZOBRIST_EP[new_ep[1]]
 
     return h
-
 
 # ---------------------------------------------------------------------------
 # Opening book / FEN helpers
@@ -223,7 +221,7 @@ def update_bot_runtime_state(bot, board, color, position_counts, comm_queue,
     bot.bot_name = bot_name
     bot.ply_count = ply_count
     bot.game_mode = game_mode
-    bot.stop_time = None  # Reset stale stop_time from previous searches
+    bot.stop_time = None
 
     bot.time_left = kwargs.get("time_left")
     bot.increment = kwargs.get("increment")
@@ -502,16 +500,7 @@ def get_pv_data(bot, max_depth, root_move):
     return pv_san, pv_raw
 
 
-def get_root_tb_eval_relative(bot):
-    return None
-
-
-def get_best_tablebase_move_with_eval(bot):
-    return None, None
-
-
-def report_root_tb_solution(bot, tb_move, tb_eval, perfect_play=False, emit_move=False):
-    return False
+# (Tablebase stubs removed)
 
 
 def build_flat_pst_tables(mg_values, eg_values, piece_square_tables):

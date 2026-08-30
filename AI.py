@@ -1,4 +1,4 @@
-# AI.py (v1)
+# AI.py (v1.1)
 
 import time
 import random
@@ -218,33 +218,7 @@ class ChessBot:
     def _format_move(self, board_before, move):
         return format_bot_move(self, board_before, move)
 
-    def _is_opening_position(self, board):
-        return (len(board.white_pieces) + len(board.black_pieces)) >= self.OPENING_TOTAL_PIECE_THRESHOLD
-
-    def _opening_development_bonus(self, move, moving_piece):
-        if moving_piece is None: return 0
-        (fr, fc), (tr, tc) = move
-        from_center = abs(fr - 3.5) + abs(fc - 3.5)
-        to_center   = abs(tr - 3.5) + abs(tc - 3.5)
-        center_delta = from_center - to_center
-        bonus = 0
-        if type(moving_piece) is Knight:
-            bonus += int(center_delta * self.OPENING_KNIGHT_CENTER_WEIGHT)
-            if (moving_piece.color == 'white' and fr == ROWS - 1) or (moving_piece.color == 'black' and fr == 0):
-                bonus += self.OPENING_KNIGHT_DEVELOP_BONUS
-            return bonus
-        if type(moving_piece) is Pawn:
-            bonus += int(center_delta * self.OPENING_PAWN_CENTER_WEIGHT)
-            if tc in self.OPENING_CENTRAL_FILES:
-                bonus += self.OPENING_CENTER_PAWN_BONUS
-            return bonus
-        return 0
-
-    def _get_root_tb_eval_relative(self):
-        return None
-
-    def _get_best_tablebase_move_with_eval(self):
-        return None, None
+    # (Unused opening bonus & tablebase stubs removed)
 
     def _run_depth_iteration(self, depth, root_moves, root_hash, pv_move,
                              prev_iter_score=None, alpha_floor=None):
@@ -308,8 +282,7 @@ class ChessBot:
     def _get_pv_data(self, max_depth, root_move):
         return get_pv_data(self, max_depth, root_move)
 
-    def _report_root_tb_solution(self, tb_move, tb_eval, perfect_play=False, emit_move=False):
-        return False
+    # (Report root tb stub removed)
 
     def make_move(self):
         try:
@@ -595,14 +568,21 @@ class ChessBot:
                     if static_eval is None:
                         static_eval = self._get_cached_static_eval(board, turn, hash_val)
                     if static_eval >= beta:
-                        reduction  = self.NMP_BASE_REDUCTION + (depth // self.NMP_DEPTH_DIVISOR)
-                        null_hash  = hash_val ^ ZOBRIST_TURN
-                        score = -self.negamax(board, depth - 1 - reduction, -beta, -beta + 1,
-                                            opponent_turn, ply + 1, search_path,
-                                            null_hash, None, extensions)
+                        reduction = self.NMP_BASE_REDUCTION + (depth // self.NMP_DEPTH_DIVISOR)
+                        null_hash = hash_val ^ ZOBRIST_TURN
+                        saved_ep = board.ep_square
+                        if saved_ep:
+                            board.ep_square = None
+                            from EngineRuntime import ZOBRIST_EP
+                            null_hash ^= ZOBRIST_EP[saved_ep[1]]
+                        try:
+                            score = -self.negamax(board, depth - 1 - reduction, -beta, -beta + 1,
+                                                opponent_turn, ply + 1, search_path,
+                                                null_hash, None, extensions)
+                        finally:
+                            board.ep_square = saved_ep
                         if score >= beta: 
                             # Fail-soft return, but clamp false mate scores
-                            # (skipping a turn creates hallucinated mate distances)
                             return score if score < self.MATE_SCORE - 1000 else beta
 
             # --- FORWARD FUTILITY PRUNING (Original Conservative Version) ---
@@ -869,13 +849,18 @@ class ChessBot:
             elif is_good_tactic:
                 score = self.BONUS_CAPTURE + (swing * 100) - moving_piece.z_idx
             elif move == k1:
-                score = 4_000_000
+                score = self.BONUS_KILLER_1
             elif move == k2:
-                score = 3_000_000
+                score = self.BONUS_KILLER_2
             elif move == counter_move:
                 score = 2_000_000
             else:
                 score = history_table[r1 * 8 + c1][r2 * 8 + c2]
+                if prev_move_tuple and moving_piece:
+                    prev_move, prev_pt_idx = prev_move_tuple
+                    pr, pc = prev_move[1]
+                    prev_to_sq = pr * 8 + pc
+                    score += self.continuation_history[c_idx][prev_pt_idx][prev_to_sq][moving_piece.z_idx][r2 * 8 + c2]
 
             scored_moves.append((score, move, is_good_tactic, moving_piece))
 
@@ -905,9 +890,19 @@ class ChessBot:
 
         piece_lists = [board.white_pieces, board.black_pieces]
 
+        # Pre-count pawns per file for fast structure evaluation
+        w_pawn_files = [0] * 8
+        b_pawn_files = [0] * 8
+        for p in board.white_pieces:
+            if p.z_idx == 0: w_pawn_files[p.pos[1]] += 1
+        for p in board.black_pieces:
+            if p.z_idx == 0: b_pawn_files[p.pos[1]] += 1
+
         for color_idx in (0, 1):
             pieces   = piece_lists[color_idx]
             is_white = (color_idx == 0)
+            my_pawn_files  = w_pawn_files if is_white else b_pawn_files
+            opp_pawn_files = b_pawn_files if is_white else w_pawn_files
             pst_mg   = FLAT_PST_MG_WHITE if is_white else FLAT_PST_MG_BLACK
             pst_eg   = FLAT_PST_EG_WHITE if is_white else FLAT_PST_EG_BLACK
 
@@ -919,9 +914,43 @@ class ChessBot:
                 scores_mg[color_idx] += pst_mg[z][sq]
                 scores_eg[color_idx] += pst_eg[z][sq]
 
+                # Rook on open / semi-open files
+                if z == 3:
+                    if my_pawn_files[c] == 0:
+                        if opp_pawn_files[c] == 0:
+                            scores_mg[color_idx] += self.EVAL_ROOK_OPEN_FILE
+                            scores_eg[color_idx] += self.EVAL_ROOK_OPEN_FILE
+                        else:
+                            scores_mg[color_idx] += self.EVAL_ROOK_SEMI_OPEN
+                            scores_eg[color_idx] += self.EVAL_ROOK_SEMI_OPEN
+
+                # Passed pawn bonus
+                elif z == 0:
+                    advancement = (7 - r) if is_white else r
+                    # Check if enemy pawns exist in front of this pawn on same or adjacent files
+                    is_passed = True
+                    for fc in range(max(0, c - 1), min(8, c + 2)):
+                        opp_pieces = board.black_pieces if is_white else board.white_pieces
+                        for opp_p in opp_pieces:
+                            if opp_p.z_idx == 0 and opp_p.pos[1] == fc:
+                                if (is_white and opp_p.pos[0] < r) or (not is_white and opp_p.pos[0] > r):
+                                    is_passed = False
+                                    break
+                        if not is_passed: break
+                    if is_passed and advancement < len(self.EVAL_PASSED_PAWN_RANK):
+                        scores_eg[color_idx] += self.EVAL_PASSED_PAWN_RANK[advancement]
+
+            # Bishop pair bonus
             if board.piece_counts_z['white' if is_white else 'black'][2] >= 2:
                 scores_mg[color_idx] += self.EVAL_BISHOP_PAIR
                 scores_eg[color_idx] += self.EVAL_BISHOP_PAIR
+
+            # Doubled pawn penalty (-15 per doubled pawn)
+            for count in my_pawn_files:
+                if count > 1:
+                    penalty = (count - 1) * 15
+                    scores_mg[color_idx] -= penalty
+                    scores_eg[color_idx] -= penalty
 
         phase     = min(256, (phase_material_score * 256) // INITIAL_PHASE_MATERIAL) if INITIAL_PHASE_MATERIAL > 0 else 0
         inv_phase = 256 - phase

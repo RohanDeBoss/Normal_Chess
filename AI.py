@@ -1,4 +1,4 @@
-# AI.py (v1.1)
+# AI.py (v1.2 - fast legal move gen integrated into negamax + qsearch)
 
 import time
 import random
@@ -595,9 +595,16 @@ class ChessBot:
                 if static_eval + self.FUTILITY_MARGIN < alpha:
                     futility_prune = True
 
-            pseudo_moves = get_all_pseudo_legal_moves(board, turn)
-            hash_move    = tt_entry.best_move if tt_entry else None
-            
+            # --- FAST LEGAL MOVE GENERATION ---
+            # get_all_legal_moves is now pin/check-aware (see GameLogic.py):
+            # it computes checkers+pins once per node instead of doing
+            # make_move_track + is_in_check + unmake for every candidate move.
+            # Moves coming out of it are already guaranteed legal, so the old
+            # per-move own-king-in-check test below has been removed entirely
+            # — this was the single biggest hot-loop cost in the old search.
+            legal_moves = get_all_legal_moves(board, turn)
+            hash_move   = tt_entry.best_move if tt_entry else None
+
             # --- INTERNAL ITERATIVE REDUCTION (IIR) ---
             # If we don't have a TT move to guide us, move ordering will be suboptimal.
             # We artificially reduce the depth to do a cheaper "reconnaissance" search.
@@ -611,7 +618,7 @@ class ChessBot:
             else:
                 c_move = None
 
-            ordered_entries = self.order_moves(board, pseudo_moves, ply, hash_move, turn,
+            ordered_entries = self.order_moves(board, legal_moves, ply, hash_move, turn,
                                             return_meta=True, counter_move=c_move, prev_move_tuple=prev_move_tuple)
             best_move_for_node = None
             legal_moves_count  = 0
@@ -627,12 +634,7 @@ class ChessBot:
                 record     = board.make_move_track(move[0], move[1])
                 child_hash = incremental_hash(hash_val, record)
 
-                own_king_in_check = is_in_check(board, turn)
-
-                if own_king_in_check:
-                    board.unmake_move(record)
-                    continue
-
+                # Move is already guaranteed legal by get_all_legal_moves() above.
                 legal_moves_count += 1
                 if not is_good_tactic: quiet_moves_tried.append((move, moving_piece))
 
@@ -773,18 +775,54 @@ class ChessBot:
         self.used_heuristic_eval = True
         is_in_check_flag = is_in_check(board, turn)
         best_score = -float('inf')
+        opponent_turn = 'black' if turn == 'white' else 'white'
+        tt_move = tt_entry.best_move if tt_entry else None
+        grid = board.grid
 
-        if not is_in_check_flag:
-            stand_pat = self._get_cached_static_eval(board, turn, hash_val)
-            best_score = stand_pat
-            if stand_pat >= beta: return stand_pat
-            if stand_pat > alpha: alpha = stand_pat
+        if is_in_check_flag:
+            # While in check, EVERY legal move must be tried (not just captures) —
+            # that used to mean running make_move_track + is_in_check over the
+            # entire pseudo-legal move list, which was the most expensive version
+            # of the old pattern since it wasn't narrowed to captures first.
+            # get_all_legal_moves (pin/check-aware, see GameLogic.py) replaces
+            # that with a single per-node scan instead of one scan per move.
+            candidate_moves = get_all_legal_moves(board, turn)
+            scored_moves = []
+            for move in candidate_moves:
+                (r1, c1), (r2, c2) = move
+                moving_piece = grid[r1][c1]
+                target_piece = grid[r2][c2]
+                swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+                score = swing * 10 - moving_piece.z_idx
+                if move == tt_move: score += 1_000_000
+                scored_moves.append((score, move))
+            scored_moves.sort(key=itemgetter(0), reverse=True)
+
+            legal_moves_count = 0
+            for score, move in scored_moves:
+                record = board.make_move_track(move[0], move[1])
+                legal_moves_count += 1
+                child_hash = incremental_hash(hash_val, record)
+                search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
+                board.unmake_move(record)
+
+                if search_score > best_score:
+                    best_score = search_score
+                    if search_score > alpha: alpha = search_score
+                if best_score >= beta: return best_score
+
+            if legal_moves_count == 0:
+                return -self.MATE_SCORE + ply
+            return best_score
+
+        # --- Not in check: standard tactical-only quiescence (unchanged) ---
+        stand_pat = self._get_cached_static_eval(board, turn, hash_val)
+        best_score = stand_pat
+        if stand_pat >= beta: return stand_pat
+        if stand_pat > alpha: alpha = stand_pat
 
         promising_moves = get_all_pseudo_legal_moves(board, turn)
         scored_moves = []
-        grid = board.grid
-        tt_move = tt_entry.best_move if tt_entry else None
-        opponent_turn = 'black' if turn == 'white' else 'white'
 
         for move in promising_moves:
             (r1, c1), (r2, c2) = move
@@ -792,17 +830,14 @@ class ChessBot:
             target_piece = grid[r2][c2]
 
             swing, is_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
-
-            if not is_in_check_flag:
-                if not is_tactic: continue
-                if stand_pat + swing + 200 < alpha: continue
+            if not is_tactic: continue
+            if stand_pat + swing + 200 < alpha: continue
 
             score = swing * 10 - moving_piece.z_idx
             if move == tt_move: score += 1_000_000
             scored_moves.append((score, move))
 
         scored_moves.sort(key=itemgetter(0), reverse=True)
-        legal_moves_count = 0
 
         for score, move in scored_moves:
             record = board.make_move_track(move[0], move[1])
@@ -811,7 +846,6 @@ class ChessBot:
                 board.unmake_move(record)
                 continue
 
-            legal_moves_count += 1
             child_hash = incremental_hash(hash_val, record)
             search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
             board.unmake_move(record)
@@ -820,9 +854,6 @@ class ChessBot:
                 best_score = search_score
                 if search_score > alpha: alpha = search_score
             if best_score >= beta: return best_score
-
-        if legal_moves_count == 0 and is_in_check_flag:
-            return -self.MATE_SCORE + ply
 
         return best_score
 

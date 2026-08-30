@@ -1,16 +1,4 @@
-# EngineRuntime.py (v1.5 - PyPy port: JIT warmup on worker boot, array-TT-aware get_pv_data)
-#
-# Changelog vs v1.4:
-#   - Added _jit_warmup(), called once at the top of persistent_worker()
-#     before the first real task is pulled off the queue. Runs a
-#     throwaway low-depth search so PyPy's JIT compiles the hot
-#     negamax/qsearch/order_moves loops during worker startup instead of
-#     during the player's first real move.
-#   - get_pv_data() previously read AI.py's search table via
-#     bot.tt.get(h) (dict-based TTEntry). AI.py's ChessBot now stores
-#     the table as arrays (see AI.py v1.3), so this reads it via
-#     bot._tt_probe(h) / bot.tt_moves[idx] instead.
-#   - Added Board and multiprocessing imports needed by _jit_warmup.
+# EngineRuntime.py (v1.6 - Parameterized Fullmove FEN counter + JIT compiler trick)
 
 import glob
 import inspect
@@ -34,15 +22,13 @@ OPTIONAL_BOT_KWARGS = (
     "show_tt_fullness",
 )
 
-
 # ---------------------------------------------------------------------------
-# Zobrist hashing (Pieces, Turn, Castling Rights, En Passant)
+# Zobrist hashing
 # ---------------------------------------------------------------------------
 ZOBRIST_ARRAY  = None
 ZOBRIST_TURN   = None
 ZOBRIST_CASTLE = None
 ZOBRIST_EP     = None
-
 
 def initialize_zobrist_table():
     global ZOBRIST_ARRAY, ZOBRIST_TURN, ZOBRIST_CASTLE, ZOBRIST_EP
@@ -56,9 +42,7 @@ def initialize_zobrist_table():
     ZOBRIST_EP     = [random.getrandbits(64) for _ in range(8)]
     random.seed()
 
-
 initialize_zobrist_table()
-
 
 def board_hash(board, turn):
     h = 0
@@ -79,29 +63,24 @@ def board_hash(board, turn):
         h ^= ZOBRIST_EP[board.ep_square[1]]
     return h
 
-
 def incremental_hash(parent_hash, record_tuple):
     start, end, mp_piece, removed, added, old_c, old_ep, _, special, new_c, new_ep = record_tuple
     h = parent_hash ^ ZOBRIST_TURN
     arr = ZOBRIST_ARRAY
     c_idx = 0 if mp_piece.color == "white" else 1
 
-    # Remove moving piece from start
     h ^= arr[c_idx][mp_piece.z_idx][start[0]][start[1]]
 
-    # Place piece on destination (Queen if promoted)
     if special == 3:
         h ^= arr[c_idx][4][end[0]][end[1]]
     else:
         h ^= arr[c_idx][mp_piece.z_idx][end[0]][end[1]]
 
-    # Remove captured pieces
     for p, r, c in removed:
         if p is not None and p is not mp_piece:
             pc_idx = 0 if p.color == "white" else 1
             h ^= arr[pc_idx][p.z_idx][r][c]
 
-    # Castling rook displacement
     if special == 1:
         sr = start[0]
         if end[1] == 6:
@@ -109,11 +88,9 @@ def incremental_hash(parent_hash, record_tuple):
         elif end[1] == 2:
             h ^= arr[c_idx][3][sr][0] ^ arr[c_idx][3][sr][3]
 
-    # Castling rights difference
     if old_c != new_c:
         h ^= ZOBRIST_CASTLE[old_c] ^ ZOBRIST_CASTLE[new_c]
 
-    # En Passant difference
     if old_ep != new_ep:
         if old_ep:
             h ^= ZOBRIST_EP[old_ep[1]]
@@ -128,8 +105,7 @@ def incremental_hash(parent_hash, record_tuple):
 _CLS_TO_CHAR = {Pawn: "P", Knight: "N", Bishop: "B", Rook: "R", Queen: "Q", King: "K"}
 OPENING_BOOK = {}
 
-
-def board_to_fen(board, turn):
+def board_to_fen(board, turn, fullmove=1):
     fen = ""
     for r in range(ROWS):
         empty = 0
@@ -160,8 +136,7 @@ def board_to_fen(board, turn):
     if board.ep_square:
         ep_str = f"{'abcdefgh'[board.ep_square[1]]}{'87654321'[board.ep_square[0]]}"
 
-    return f"{fen}{t_str}{c_str} {ep_str} {board.halfmove_clock} 1"
-
+    return f"{fen}{t_str}{c_str} {ep_str} {board.halfmove_clock} {fullmove}"
 
 def _find_opening_book_files():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -184,7 +159,6 @@ def _find_opening_book_files():
         reverse=True,
     )
 
-
 for _book_filename in _find_opening_book_files():
     try:
         with open(_book_filename, "r", encoding="utf-8") as f:
@@ -193,34 +167,19 @@ for _book_filename in _find_opening_book_files():
     except Exception as e:
         print(f"Opening book not found or invalid at {_book_filename}: {e}")
 
-
 # ---------------------------------------------------------------------------
 # Common bot lifecycle helpers
 # ---------------------------------------------------------------------------
 class SearchCancelledException(Exception):
     pass
 
-
 def calc_time_check_mask(allocated):
-    if allocated <= 0.15:
-        return 15
-    if allocated <= 0.30:
-        return 31
-    if allocated <= 0.60:
-        return 63
-    if allocated <= 1.20:
-        return 127
-    if allocated <= 2.50:
-        return 255
+    if allocated <= 0.15: return 15
+    if allocated <= 0.30: return 31
+    if allocated <= 0.60: return 63
+    if allocated <= 1.20: return 127
+    if allocated <= 2.50: return 255
     return 511
-
-
-# NOTE: time-budgeting formula intentionally does NOT live here. Unlike
-# hashing/FEN/dispatch, it's a *tunable strategy* (per §6.6 of the README),
-# so AI.py and OPAI.py each keep an independent, duplicated copy of the
-# constants + method. Do not re-add a shared version of this here even if
-# the two copies look identical today — that would silently couple them.
-
 
 def update_bot_runtime_state(bot, board, color, position_counts, comm_queue,
                              cancellation_event, bot_name, ply_count, game_mode,
@@ -249,19 +208,16 @@ def update_bot_runtime_state(bot, board, color, position_counts, comm_queue,
 
     bot.current_age += 1
 
-
 def accepted_bot_kwargs(bot_class, values):
     accepted_params = set(inspect.signature(bot_class.__init__).parameters)
     return {k: values[k] for k in OPTIONAL_BOT_KWARGS
             if k in values and k in accepted_params}
-
 
 def run_bot_turn(bot):
     if bot.search_depth == 99:
         bot.ponder_indefinitely()
     else:
         bot.make_move()
-
 
 def run_ai_process(board, color, position_counts, comm_queue, cancellation_event,
                    bot_class, bot_name, search_depth, ply_count, game_mode,
@@ -279,13 +235,10 @@ def run_ai_process(board, color, position_counts, comm_queue, cancellation_event
     bot.search_depth = search_depth
     run_bot_turn(bot)
 
-
 # ---------------------------------------------------------------------------
-# Persistent worker - one bot instance per worker process
+# Persistent worker
 # ---------------------------------------------------------------------------
 class TaskQueueWrapper:
-    """Intercept worker messages and tag them with the active task_id."""
-
     def __init__(self, real_queue, task_id):
         self.real_queue = real_queue
         self.task_id = task_id
@@ -295,7 +248,6 @@ class TaskQueueWrapper:
             self.real_queue.put(item + (self.task_id,))
         else:
             self.real_queue.put(item)
-
 
 class EngineWorker:
     def __init__(self, bot_class):
@@ -330,34 +282,17 @@ class EngineWorker:
         self.bot.search_depth = task["search_depth"]
         run_bot_turn(self.bot)
 
-
 def _jit_warmup(bot_class):
-    """
-    Run one throwaway low-depth search the instant a persistent worker
-    boots, before any real task is pulled off the queue.
-
-    PyPy's JIT only compiles a loop after it's proven "hot" by running
-    many times; without this, the very first move of the game pays full
-    interpreter-speed cost while negamax/qsearch/order_moves get
-    compiled. Doing it here means that one-time cost lands during app
-    startup (while the UI window is still coming up) instead of during
-    the player's first real move.
-
-    Uses throwaway Queue/Event objects so nothing here touches the real
-    comm/cancel channels, and any failure is swallowed — a failed
-    warmup just means the first real move is a bit slower, not a
-    correctness problem.
-    """
     try:
         dummy_bot = bot_class(
             Board(), 'white', {}, mp.Queue(), mp.Event(),
             bot_name="__warmup__", ply_count=0, game_mode="bot",
+            use_opening_book=False,  # Force JIT to compile search/eval, not just book lookup
         )
         dummy_bot.search_depth = 4
         dummy_bot.make_move()
     except Exception:
         pass
-
 
 def persistent_worker(work_queue, comm_queue, cancel_event, bot_class):
     worker = EngineWorker(bot_class)
@@ -374,18 +309,15 @@ def persistent_worker(work_queue, comm_queue, cancel_event, bot_class):
             traceback.print_exc()
             TaskQueueWrapper(comm_queue, task.get("task_id", -1)).put(("move", None))
 
-
 # ---------------------------------------------------------------------------
 # PGN, Opening Sequence & Statistics Handlers
 # ---------------------------------------------------------------------------
 _CASUALTIES_RE = re.compile(r'\s*\(.*?\)')
 
 def strip_casualties(san_str):
-    """Strips casualty brackets from SAN strings for short notation display."""
     return _CASUALTIES_RE.sub('', san_str) if san_str else ""
 
 def generate_pgn(full_history, game_result=None):
-    """Generates a complete PGN string from game history tuples."""
     if not full_history: return ""
     moves = []
     start_turn = full_history[0][1]
@@ -410,7 +342,6 @@ def generate_pgn(full_history, game_result=None):
     return pgn.strip()
 
 def generate_series_opening_sequence(board, num_plies=2):
-    """Generates a random legal opening move sequence for AI series matches."""
     opening_sequence = []
     temp_board = board.clone()
     temp_turn = "white"
@@ -425,7 +356,6 @@ def generate_series_opening_sequence(board, num_plies=2):
     return opening_sequence
 
 def write_series_stats_file(out_path, move_stats, series_stats, main_name, op_name, use_clock, time_control_sec, increment, fixed_depth, total_series_games):
-    """Calculates trimmed means/aggregates and writes AI_Series_Results.txt."""
     if not move_stats: return
     
     def _summarise(stats):
@@ -480,22 +410,8 @@ def write_series_stats_file(out_path, move_stats, series_stats, main_name, op_na
     except Exception as e:
         print(f"Failed to save stats: {e}")
 
-
-# ---------------------------------------------------------------------------
-# Shared search infrastructure — pure plumbing, no tunable constants.
-# Every bot subclass (AI.py, OPAI.py, or future ones) uses these verbatim;
-# behavior-affecting logic (time budgets, pruning, eval weights) does NOT
-# belong here.
-#
-# TTEntry / TT_FLAG_* remain here as the shared flag-value contract between
-# bot subclasses. AI.py's ChessBot (v1.3+) no longer stores TTEntry objects
-# in a dict — it uses array-backed tables internally (see AI.py) — but the
-# flag *values* below are still what gets written into those arrays, so any
-# bot subclass must keep using them rather than inventing its own.
-# ---------------------------------------------------------------------------
 TTEntry = namedtuple('TTEntry', ['score', 'depth', 'flag', 'best_move', 'age'])
 TT_FLAG_EXACT, TT_FLAG_LOWERBOUND, TT_FLAG_UPPERBOUND = 0, 1, 2
-
 
 def format_bot_move(bot, board_before, move):
     if not move: return "None"
@@ -503,12 +419,7 @@ def format_bot_move(bot, board_before, move):
     child.make_move(move[0], move[1])
     return format_move_san(board_before, child, move)
 
-
 def get_pv_data(bot, max_depth, root_move):
-    """Walks the principal variation out of bot's transposition table.
-    Reads the array-backed TT via bot._tt_probe/bot.tt_moves (see AI.py
-    v1.3) rather than a dict — every ChessBot-family bot must expose
-    those two."""
     if not root_move: return [], []
 
     pv_san  = []
@@ -522,7 +433,6 @@ def get_pv_data(bot, max_depth, root_move):
     for i in range(max_depth):
         if not move: break
 
-        # --- SAFETY GUARD AGAINST TT COLLISIONS / STALE PV MOVES ---
         p = current_board.grid[move[0][0]][move[0][1]]
         if not p or p.color != current_turn: break
 
@@ -552,12 +462,7 @@ def get_pv_data(bot, max_depth, root_move):
 
     return pv_san, pv_raw
 
-
-# (Tablebase stubs removed)
-
-
 def build_flat_pst_tables(mg_values, eg_values, piece_square_tables):
-    """Pre-flattens 8x8 piece-square tables + material values into 1D 64-element lookup arrays for Black and White."""
     flat_mg_w = [None] * 6
     flat_mg_b = [None] * 6
     flat_eg_w = [None] * 6

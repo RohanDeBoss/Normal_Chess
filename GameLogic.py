@@ -1,4 +1,4 @@
-# GameLogic.py (v73.0 - Standard Chess Rules, pin-aware fast legal move gen)
+# GameLogic.py (v1.0 - Fixed SAN disambiguation)
 
 
 # -----------------------------------------------------------------------
@@ -82,13 +82,6 @@ def _clone_piece_fast(piece):
 
 # -----------------------------------------------------------------------
 # Piece classes
-#
-# __slots__ added: these objects get created/cloned by the million during
-# search, and every attribute access (.pos, .color, .z_idx lookups happen
-# constantly in negamax/qsearch/eval) is on the hot path. __slots__ removes
-# the per-instance __dict__, which cuts memory churn and speeds up attribute
-# access. _clone_piece_fast is unaffected — it already sets attributes
-# individually via cls.__new__(cls), which works identically with slots.
 # -----------------------------------------------------------------------
 class Piece:
     __slots__ = ('color', 'opponent_color', 'pos', '_list_pos', '_z_list_pos')
@@ -142,7 +135,6 @@ class Pawn(Piece):
 # -----------------------------------------------------------------------
 # Board
 # -----------------------------------------------------------------------
-# Castling Bitmasks: White-King = 1, White-Queen = 2, Black-King = 4, Black-Queen = 8
 CASTLE_WK = 1
 CASTLE_WQ = 2
 CASTLE_BK = 4
@@ -176,19 +168,12 @@ class Board:
             for c, piece_class in piece_list:
                 self.add_piece(piece_class(color), r, c)
 
-    # ---- O(1) piece-list helpers ------------------------------------------
-
     def _list_append(self, piece):
-        """Append to the colour list and record the resulting index."""
         lst             = self.white_pieces if piece.color == 'white' else self.black_pieces
         piece._list_pos = len(lst)
         lst.append(piece)
 
     def _list_remove(self, piece):
-        """
-        O(1) swap-and-pop removal.  Swaps piece with the last element so the
-        list stays compact, then pops the tail.
-        """
         idx = piece._list_pos
         if idx < 0:
             return
@@ -198,8 +183,6 @@ class Board:
         last._list_pos = idx
         lst.pop()
         piece._list_pos = -1
-
-    # ---- Board mutation primitives ----------------------------------------
 
     def add_piece(self, piece, r, c):
         if self.grid[r][c] is not None:
@@ -503,30 +486,7 @@ def get_all_pseudo_legal_moves(board, color):
 
     return moves
 
-
-# -----------------------------------------------------------------------
-# Fast, pin/check-aware legal move generation.
-#
-# The old approach called make_move_track + is_in_check (a full board-attack
-# scan) + unmake_move for EVERY pseudo-legal candidate move. is_in_check is
-# expensive (pawn/knight/king/ray scans from the king), so that cost was paid
-# once per candidate move — roughly 30-40x per node more than necessary.
-#
-# This version computes checkers + pinned pieces ONCE per position (one scan,
-# same cost as a single is_in_check call), then filters the pseudo-legal
-# move list with cheap set-membership checks. King moves and the rare
-# en-passant discovered-check edge case still need a small amount of extra
-# verification, but everything else is filtered for free.
-#
-# IMPORTANT: this is exactly the kind of code where subtle bugs hide (pins,
-# double check, en passant). Verify with Perft (start position depth 5-6,
-# plus the two positions noted below) before trusting it in real games.
-# -----------------------------------------------------------------------
-
 def _is_square_attacked_ignoring_square(board, r, c, attacking_color, ignore_pos):
-    """Same as is_square_attacked, but treats ignore_pos as empty. Needed
-    because when a king steps away along the same line as a checking slider,
-    the slider's ray must be allowed to see 'through' the king's old square."""
     grid = board.grid
     ir, ic = ignore_pos
     original = grid[ir][ic]
@@ -536,13 +496,7 @@ def _is_square_attacked_ignoring_square(board, r, c, attacking_color, ignore_pos
     finally:
         grid[ir][ic] = original
 
-
 def _compute_check_and_pins(board, color):
-    """Single-pass scan (same cost as one is_in_check call). Returns:
-        kpos:     (r, c) of the king
-        checkers: list of (piece, r, c) currently attacking the king
-        pinned:   dict {(r,c) of a pinned own piece: frozenset(allowed squares)}
-    """
     opp  = OPPONENT_COLOR[color]
     kpos = board.find_king_pos(color)
     kr, kc = kpos
@@ -551,7 +505,7 @@ def _compute_check_and_pins(board, color):
 
     checkers = []
 
-    # Pawn checks (mirrors is_square_attacked's pawn logic)
+    # Pawn checks
     p_dir = 1 if opp == 'white' else -1
     for dc in (-1, 1):
         pr, pc = kr + p_dir, kc + dc
@@ -595,16 +549,13 @@ def _compute_check_and_pins(board, color):
 
     return kpos, checkers, pinned
 
-
 def _generate_legal_moves(board, color):
-    """Yields legal (start, end) moves for `color`."""
     kpos, checkers, pinned = _compute_check_and_pins(board, color)
     grid = board.grid
     opp = OPPONENT_COLOR[color]
     kr, kc = kpos
     num_checkers = len(checkers)
 
-    # --- Double check: only king moves are legal ---
     if num_checkers >= 2:
         for tr, tc in KING_ATTACKS_FROM[(kr, kc)]:
             target = grid[tr][tc]
@@ -613,13 +564,12 @@ def _generate_legal_moves(board, color):
                     yield ((kr, kc), (tr, tc))
         return
 
-    # --- Single check: build the set of squares that block/capture it ---
     block_squares = None
     checker_sq = None
     if num_checkers == 1:
         checker_piece, ccr, ccc = checkers[0]
         checker_sq = (ccr, ccc)
-        if checker_piece.z_idx in (2, 3, 4):  # sliding piece -> can block
+        if checker_piece.z_idx in (2, 3, 4):
             dr = (ccr > kr) - (ccr < kr)
             dc = (ccc > kc) - (ccc < kc)
             block_squares = set()
@@ -629,20 +579,19 @@ def _generate_legal_moves(board, color):
                 r += dr
                 c += dc
             block_squares.add((ccr, ccc))
-        else:  # knight/pawn check -> must capture it, can't block
+        else:
             block_squares = {(ccr, ccc)}
 
     for (sr, sc), (tr, tc) in get_all_pseudo_legal_moves(board, color):
         piece = grid[sr][sc]
 
-        if piece.z_idx == 5:  # King
+        if piece.z_idx == 5:
             if _is_square_attacked_ignoring_square(board, tr, tc, opp, kpos):
                 continue
             yield ((sr, sc), (tr, tc))
             continue
 
         if num_checkers == 1 and (tr, tc) not in block_squares:
-            # Exception: en passant capturing the checking pawn itself
             is_ep_of_checker = (piece.z_idx == 0 and (tr, tc) == board.ep_square
                                  and checker_sq == (sr, tc))
             if not is_ep_of_checker:
@@ -652,9 +601,6 @@ def _generate_legal_moves(board, color):
         if pin_ray is not None and (tr, tc) not in pin_ray:
             continue
 
-        # En passant can expose a *discovered* horizontal check that the pin
-        # scan above can't see (it removes two pieces from the rank at once).
-        # Rare enough that brute-force verification here costs nothing.
         if piece.z_idx == 0 and (tr, tc) == board.ep_square and sc != tc:
             rec = board.make_move_track((sr, sc), (tr, tc))
             still_in_check = is_in_check(board, color)
@@ -664,37 +610,29 @@ def _generate_legal_moves(board, color):
 
         yield ((sr, sc), (tr, tc))
 
-
 def get_all_legal_moves(board, color):
     return list(_generate_legal_moves(board, color))
-
 
 def has_legal_moves(board, color):
     for _ in _generate_legal_moves(board, color):
         return True
     return False
 
-
 def is_insufficient_material(board):
     pcz_w = board.piece_counts_z['white']
     pcz_b = board.piece_counts_z['black']
-    # If any pawns, rooks, or queens exist, material is sufficient
     if pcz_w[0] > 0 or pcz_b[0] > 0 or pcz_w[3] > 0 or pcz_b[3] > 0 or pcz_w[4] > 0 or pcz_b[4] > 0:
         return False
 
     w_count, b_count = len(board.white_pieces), len(board.black_pieces)
-    # K vs K
     if w_count == 1 and b_count == 1:
         return True
-    # K+N vs K or K+B vs K
     if (w_count <= 2 and b_count == 1) or (b_count <= 2 and w_count == 1):
         return True
-    # K+B vs K+B (same color bishops) or K+N vs K+N / K+B vs K+N
     if w_count == 2 and b_count == 2:
         if pcz_w[2] == 1 and pcz_b[2] == 1:
             w_b_pos = next(p.pos for p in board.white_pieces if p.z_idx == 2)
             b_b_pos = next(p.pos for p in board.black_pieces if p.z_idx == 2)
-            # Same color square bishops cannot mate
             if (w_b_pos[0] + w_b_pos[1]) % 2 == (b_b_pos[0] + b_b_pos[1]) % 2:
                 return True
         elif (pcz_w[1] == 1 and pcz_b[1] == 1) or (pcz_w[2] == 1 and pcz_b[1] == 1) or (pcz_w[1] == 1 and pcz_b[2] == 1):
@@ -709,7 +647,7 @@ def _get_board_hash():
         _board_hash_fn = board_hash
     return _board_hash_fn
 
-def get_game_state(board, turn_to_move, position_counts, ply_count, max_moves):
+def get_game_state(board, turn_to_move, position_counts, ply_count=0, max_moves=None):
     in_chk = is_in_check(board, turn_to_move)
     if not has_legal_moves(board, turn_to_move):
         if in_chk:
@@ -731,7 +669,7 @@ def get_game_state(board, turn_to_move, position_counts, ply_count, max_moves):
     except ImportError:
         pass
 
-    if ply_count >= max_moves:
+    if max_moves is not None and ply_count >= max_moves:
         return ("move_limit", None)
 
     return "ongoing", None
@@ -781,16 +719,22 @@ def format_move_san(board_before, board_after, move):
                 san += f"={promo_char}"
         else:
             p_char = chars[type(p)]
-            same_pieces = [other for other in (board_before.white_pieces if p.color == 'white' else board_before.black_pieces)
-                           if type(other) is type(p) and other.pos != start_pos]
             disambig = ""
-            ambiguous = [other for other in same_pieces if move in [((other.pos), end_pos) for other in same_pieces]]
-            if ambiguous:
-                same_file = any(o.pos[1] == start_pos[1] for o in ambiguous)
-                same_rank = any(o.pos[0] == start_pos[0] for o in ambiguous)
-                if not same_file: disambig = files[start_pos[1]]
-                elif not same_rank: disambig = ranks[start_pos[0]]
-                else: disambig = f"{files[start_pos[1]]}{ranks[start_pos[0]]}"
+            if p.z_idx != 0 and p.z_idx != 5:
+                other_candidates = [
+                    m[0] for m in get_all_legal_moves(board_before, p.color)
+                    if m[1] == end_pos and m[0] != start_pos
+                    and type(board_before.grid[m[0][0]][m[0][1]]) is type(p)
+                ]
+                if other_candidates:
+                    same_file = any(pos[1] == start_pos[1] for pos in other_candidates)
+                    same_rank = any(pos[0] == start_pos[0] for pos in other_candidates)
+                    if not same_file:
+                        disambig = files[start_pos[1]]
+                    elif not same_rank:
+                        disambig = ranks[start_pos[0]]
+                    else:
+                        disambig = f"{files[start_pos[1]]}{ranks[start_pos[0]]}"
 
             san = f"{p_char}{disambig}{'x' if is_cap else ''}{files[end_pos[1]]}{ranks[end_pos[0]]}"
 

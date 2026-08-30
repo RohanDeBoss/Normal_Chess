@@ -1,4 +1,4 @@
-# ChessUI.py (v1.2 Massive UI overhaul)
+# ChessUI.py (v1.4 - Bug fixes for: Timeouts, FEN Validation, Promotions)
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -29,15 +29,12 @@ class GameMode(Enum):
 
 _FEN_CHAR_TO_CLASS = {'p': Pawn, 'n': Knight, 'b': Bishop, 'r': Rook, 'q': Queen, 'k': King}
 
-# ---------------------------------------------------------------------------
-# Main application
-# ---------------------------------------------------------------------------
 class EnhancedChessApp:
     MAIN_AI_NAME     = "AI Bot"
     OPPONENT_AI_NAME = "OP Bot"
     ANALYSIS_AI_NAME = "Analysis"
     slidermaxvalue   = 12
-    MAX_GAME_MOVES   = 200
+    MAX_GAME_MOVES   = 200 # Kept for legacy compatibility, but logic allows None
     AI_SERIES_GAMES  = 300
 
     def __init__(self, master):
@@ -45,22 +42,19 @@ class EnhancedChessApp:
         self.master.title("Standard Chess")
         random.seed()
 
-        # --- COMMUNICATION ---
         self.comm_queue = mp.Queue()
 
-        # --- PERSISTENT WORKER STATE ---
         self.current_task_id   = 0
         self.main_work_queue   = mp.Queue()
         self.op_work_queue     = mp.Queue()
         self.main_cancel_event = mp.Event()
         self.op_cancel_event   = mp.Event()
-        self.active_worker_name = None   # 'main' | 'op' | None
+        self.active_worker_name = None   
         self.analysis_thinking  = False
         self.main_worker        = None   
         self.op_worker          = None
         self._shutting_down     = False
 
-        # --- BOARD / GAME STATE ---
         self.board        = Board()
         self.turn         = "white"
         self.selected     = None
@@ -73,7 +67,6 @@ class EnhancedChessApp:
         self.is_interactive = True
         self.premove      = None
 
-        # --- DRAWING / ARROWS STATE ---
         self.custom_arrows      = set()
         self.custom_highlights  = set()
         self.rc_start_pos       = None
@@ -116,7 +109,6 @@ class EnhancedChessApp:
         
         self.hovered_pv_tag = None
 
-        # --- TIME STATE ---
         self.time_control_seconds = tk.IntVar(value=300)
         self.white_time      = 0.0
         self.black_time      = 0.0
@@ -134,7 +126,6 @@ class EnhancedChessApp:
         self.process_comm_queue()
         self.reset_game()
 
-    # ------------------------------------------------------------------ workers
     def _start_persistent_workers(self):
         self.main_worker = mp.Process(
             target=persistent_worker,
@@ -152,7 +143,6 @@ class EnhancedChessApp:
         self.op_worker.start()
 
     def _on_close(self):
-        """Shut down workers and queues so window close can't hang the process."""
         if self._shutting_down:
             return
         self._shutting_down = True
@@ -221,7 +211,6 @@ class EnhancedChessApp:
         task_id = msg[-1]
         return task_id if isinstance(task_id, int) else None
 
-    # ------------------------------------------------------------------ helpers
     def _format_san_display(self, s):
         return s if (self.long_notation_var.get() or not s) else strip_casualties(s)
 
@@ -229,7 +218,6 @@ class EnhancedChessApp:
         self.update_moves_list()
         self._render_pv()
 
-    # ------------------------------------------------------------------ clock helpers
     def _start_clock(self):
         if not self.use_clock_var.get() or self.game_over or self.clock_running:
             return
@@ -250,16 +238,20 @@ class EnhancedChessApp:
         self.clock_running   = False
         self.last_clock_tick = None
 
-    # ------------------------------------------------------------------ UI build
     def build_ui(self):
         sw, sh = self.master.winfo_screenwidth(), self.master.winfo_screenheight()
         self.master.geometry(f"{sw}x{sh}+0+0")
-        self.master.state('zoomed')
+        try:
+            self.master.state('zoomed')
+        except tk.TclError:
+            try:
+                self.master.attributes('-zoomed', True)
+            except tk.TclError:
+                pass
 
         self.main_frame = ttk.Frame(self.master, style='Left.TFrame')
         self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # --- LEFT PANEL ---
         self.left_panel = ttk.Frame(self.main_frame, style='Left.TFrame')
         self.left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         self.left_panel.pack_propagate(False)
@@ -272,7 +264,6 @@ class EnhancedChessApp:
         self.pv_text.config(state=tk.DISABLED)
         self._build_control_widgets(self.left_panel)
 
-        # --- CENTER PANEL ---
         self.center_panel = ttk.Frame(self.main_frame, style='Right.TFrame')
         self.center_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.board_column = ttk.Frame(self.center_panel, style='Right.TFrame')
@@ -310,7 +301,6 @@ class EnhancedChessApp:
                 background=self.COLORS['bg_medium'], foreground=self.COLORS['text_light'],
                 anchor="center", justify=tk.CENTER))
 
-        # Navigation bar
         self.navigation_frame = ttk.Frame(self.center_panel, style='Right.TFrame')
         self.navigation_frame.pack(fill=tk.X, pady=(5, 10))
         self.start_button, self.undo_button, self.redo_button, self.end_button = [
@@ -324,7 +314,6 @@ class EnhancedChessApp:
                                     self.redo_button,  self.end_button], start=1):
             btn.grid(row=0, column=col, padx=5)
 
-        # --- RIGHT PANEL ---
         self.right_panel = ttk.Frame(self.main_frame, style='Left.TFrame')
         self.right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         self.right_panel.pack_propagate(False)
@@ -333,7 +322,6 @@ class EnhancedChessApp:
         self.main_frame.bind("<Configure>",   self.handle_main_resize)
         self.center_panel.bind("<Configure>", self.handle_board_resize)
         
-        # --- INFORMATION SHORTCUT BUTTON ---
         self.info_btn = tk.Button(
             self.master, text="ⓘ", font=("Helvetica", 13, "bold"),
             bg=self.COLORS['bg_dark'], fg=self.COLORS['text_dark'],
@@ -342,7 +330,6 @@ class EnhancedChessApp:
         )
         self.info_btn.place(in_=self.master, relx=1.0, y=12, x=-20, anchor="ne")
         
-        # --- PERMANENT CANVAS EVENT BINDINGS ---
         self.canvas.bind("<Button-1>",        self.on_drag_start)
         self.canvas.bind("<B1-Motion>",       self.on_drag_motion)
         self.canvas.bind("<ButtonRelease-1>", self.on_drag_end)
@@ -351,7 +338,6 @@ class EnhancedChessApp:
         self.canvas.bind("<B3-Motion>",       self.on_right_click_drag)
         self.canvas.bind("<ButtonRelease-3>", self.on_right_click_end)
         
-        # Mac OS fallback for right-click support
         self.canvas.bind("<Button-2>",        self.on_right_click_start)
         self.canvas.bind("<B2-Motion>",       self.on_right_click_drag)
         self.canvas.bind("<ButtonRelease-2>", self.on_right_click_end)
@@ -470,7 +456,6 @@ class EnhancedChessApp:
         self.moves_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Global event delegation (fixes the lambda tag_bind memory leak)
         self.pv_text.bind("<Motion>", self._on_pv_text_motion)
         self.pv_text.bind("<Leave>", self._on_pv_text_leave)
         
@@ -530,7 +515,6 @@ class EnhancedChessApp:
         style.configure('TEntry', fieldbackground='#FFFFFF', foreground='#000000', insertcolor='#000000')
         return C
 
-    # ------------------------------------------------------------------ resize
     def handle_main_resize(self, event):
         w = max(240, int(event.width * 0.20))
         if w != self.left_panel.winfo_width():
@@ -596,7 +580,6 @@ class EnhancedChessApp:
             self.eval_frame.pack_forget()
             self.pv_text.pack_forget()
 
-    # ------------------------------------------------------------------ flip / swap / mode
     def _update_flip_view_button_style(self):
         mode = self.game_mode.get()
         warn = (mode == GameMode.HUMAN_VS_BOT.value and self.board_orientation != self.human_color) or \
@@ -657,9 +640,9 @@ class EnhancedChessApp:
             self.pv_text.delete(1.0, tk.END)
             self.pv_text.config(state=tk.DISABLED)
 
-    # ------------------------------------------------------------------ FEN / PGN
     def get_current_fen(self):
-        return board_to_fen(self.board, self.turn)
+        fullmove = (self.history_pointer // 2) + 1 if self.history_pointer >= 0 else 1
+        return board_to_fen(self.board, self.turn, fullmove=fullmove)
 
     def copy_fen_to_clipboard(self):
         fen = self.get_current_fen()
@@ -688,7 +671,6 @@ class EnhancedChessApp:
                 c += 1
         self.turn = "white" if (parts[1] if len(parts) > 1 else 'w').lower() == 'w' else "black"
 
-        # Parse Castling Rights
         self.board.castling_rights = 0
         if len(parts) > 2 and parts[2] != '-':
             if 'K' in parts[2]: self.board.castling_rights |= CASTLE_WK
@@ -700,13 +682,12 @@ class EnhancedChessApp:
         self.board.ep_square = None
         if len(parts) > 3 and parts[3] != '-':
             ep_str = parts[3].lower()
-            if len(ep_str) == 2 and ep_str[0] in 'abcdefgh' and ep_str[1] in '12345678':
+            valid_ep_rank = '6' if self.turn == 'white' else '3'
+            if len(ep_str) == 2 and ep_str[0] in 'abcdefgh' and ep_str[1] == valid_ep_rank:
                 self.board.ep_square = (8 - int(ep_str[1]), ord(ep_str[0]) - ord('a'))
 
-        # Parse Halfmove clock
         self.board.halfmove_clock = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
 
-        # --- CHESS LEGALITY CHECK ---
         if not self.board.white_king_pos or not self.board.black_king_pos:
             messagebox.showerror("Invalid FEN", "Illegal Position: Both Kings must be present on the board.")
             self.reset_game(schedule_ai=False)
@@ -717,7 +698,6 @@ class EnhancedChessApp:
             messagebox.showerror("Invalid FEN", f"Illegal Position: The side not to move ({passive_color}) is already in check.")
             self.reset_game(schedule_ai=False)
             return
-        # ----------------------------
 
         self.game_started = True
         self._reset_clock_state()
@@ -781,7 +761,6 @@ class EnhancedChessApp:
                 break
         self.last_clock_tick = time.time()
 
-    # ------------------------------------------------------------------ move history UI
     def update_moves_list(self):
         self.moves_text.config(state=tk.NORMAL)
         self.moves_text.delete(1.0, tk.END)
@@ -830,7 +809,6 @@ class EnhancedChessApp:
                 pass
         self.moves_text.config(state=tk.DISABLED)
 
-    # ------------------------------------------------------------------ core gameplay
     def execute_move_and_check_state(self, player_who_moved, move):
         if self.use_clock_var.get() and not self.game_over and self.increment:
             if player_who_moved == 'white':
@@ -869,19 +847,19 @@ class EnhancedChessApp:
             self.board.make_move(the_move[0], the_move[1])
             self.execute_move_and_check_state(self.turn, the_move)
 
-            # Auto-execute premove if legal, otherwise instantly clear visual highlight
             if not self.game_over and self.game_mode.get() == GameMode.HUMAN_VS_BOT.value and self.turn == self.human_color:
                 if self.premove:
                     pm = self.premove
                     self.premove = None
-                    if pm in get_all_legal_moves(self.board, self.turn):
-                        self.board.make_move(pm[0], pm[1])
-                        self.execute_move_and_check_state(self.turn, pm)
+                    start_pos, end_pos = pm[0], pm[1]
+                    promo_cls = pm[2] if len(pm) > 2 else Queen
+                    if (start_pos, end_pos) in get_all_legal_moves(self.board, self.turn):
+                        self._apply_move_with_promotion(start_pos, end_pos, promo_cls)
+                        self.execute_move_and_check_state(self.turn, (start_pos, end_pos))
                         if not self.game_over and self.turn != self.human_color:
                             self.set_interactivity(False)
                             self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
                     else:
-                        # Premove became illegal — redraw board immediately so highlight vanishes
                         self.draw_board()
 
             if not self.game_over and self.game_mode.get() == GameMode.AI_VS_AI.value:
@@ -894,41 +872,37 @@ class EnhancedChessApp:
         self.set_interactivity(True)
 
     def _get_premove_destinations(self, piece, start_pos):
-        """Returns all geometrically reachable squares for a piece on an open board."""
         sr, sc = start_pos
         sq = sr * 8 + sc
         pz = piece.z_idx
         dests = []
 
-        if pz == 0:  # Pawn
+        if pz == 0:
             p_dir = -1 if piece.color == 'white' else 1
-            # 1-step forward
             if 0 <= sr + p_dir < 8:
                 dests.append((sr + p_dir, sc))
-            # 2-steps forward from starting rank
             if sr == piece.starting_row and 0 <= sr + 2 * p_dir < 8:
                 dests.append((sr + 2 * p_dir, sc))
-            # Diagonal captures / en-passant
             for dc in (-1, 1):
                 if 0 <= sr + p_dir < 8 and 0 <= sc + dc < 8:
                     dests.append((sr + p_dir, sc + dc))
 
-        elif pz == 1:  # Knight
+        elif pz == 1:
             dests.extend(KNIGHT_ATTACKS_FROM[(sr, sc)])
 
-        elif pz == 2:  # Bishop (all diagonals regardless of blockers)
+        elif pz == 2:
             for ray in RAYS_DIAGONAL[sq]:
                 dests.extend(ray)
 
-        elif pz == 3:  # Rook (all orthogonals regardless of blockers)
+        elif pz == 3:
             for ray in RAYS_ORTHOGONAL[sq]:
                 dests.extend(ray)
 
-        elif pz == 4:  # Queen (all rays regardless of blockers)
+        elif pz == 4:
             for ray in RAYS_ALL[sq]:
                 dests.extend(ray)
 
-        elif pz == 5:  # King (1-step in any direction + castling target squares)
+        elif pz == 5:
             dests.extend(KING_ATTACKS_FROM[(sr, sc)])
             if sc == 4 and (sr == 0 or sr == 7):
                 dests.extend([(sr, 2), (sr, 6)])
@@ -962,7 +936,6 @@ class EnhancedChessApp:
 
         piece = self.board.grid[r][c]
 
-        # Check if this is a premove drag (opponent's turn in Bot mode)
         is_premove = (mode == GameMode.HUMAN_VS_BOT.value and self.turn != self.human_color) or \
                      (self.is_ai_thinking() and not self.analysis_thinking)
 
@@ -973,10 +946,8 @@ class EnhancedChessApp:
             self.selected = (r, c)
             self.drag_start = (r, c)
             self.dragging = True
-            # Only show dots on currently reachable squares
             all_pseudo = get_all_pseudo_legal_moves(self.board, self.human_color)
             self.valid_moves_for_highlight = [e for s, e in all_pseudo if s == self.selected]
-            # But allow dropping anywhere along the piece's full open-board geometry
             dests = self._get_premove_destinations(piece, (r, c))
             self.valid_moves = [(self.selected, d) for d in dests]
             self.drag_piece_ghost = self.canvas.create_text(
@@ -1035,7 +1006,9 @@ class EnhancedChessApp:
         # Enforce piece movement rules for premoves
         if is_premove:
             if (start_pos, end_pos) in self.valid_moves:
-                self.premove = (start_pos, end_pos)
+                promo_cls = self.check_and_prompt_promotion(start_pos, end_pos)
+                if promo_cls is not False:
+                    self.premove = (start_pos, end_pos, promo_cls)
             self.drag_start = None
             self.selected = None
             self.valid_moves = []
@@ -1043,11 +1016,10 @@ class EnhancedChessApp:
             self.draw_board()
             return
 
-        # Regular move (validate against current board state legal moves)
         current_legal = get_all_legal_moves(self.board, self.turn)
         if (start_pos, end_pos) in current_legal:
             promo_cls = self.check_and_prompt_promotion(start_pos, end_pos)
-            if promo_cls is False:  # User cancelled/closed promotion dialog
+            if promo_cls is False:
                 self.drag_start = None
                 self.selected = None
                 self.valid_moves = []
@@ -1076,9 +1048,7 @@ class EnhancedChessApp:
         self.update_ui_after_state_change()
         self.set_interactivity(True)
 
-    # ------------------------------------------------------------------ Promotion & Rules Verification
     def check_and_prompt_promotion(self, start_pos, end_pos):
-        """Checks if human pawn moved to back rank and requests promotion choice."""
         piece = self.board.grid[start_pos[0]][start_pos[1]]
         if isinstance(piece, Pawn):
             target_rank = 0 if piece.color == "white" else 7
@@ -1087,7 +1057,6 @@ class EnhancedChessApp:
         return None
 
     def _show_promotion_dialog(self, color):
-        """Displays modal popup to pick Queen, Rook, Bishop, or Knight."""
         dialog = tk.Toplevel(self.master)
         dialog.title("Pawn Promotion")
         dialog.configure(bg=self.COLORS['bg_dark'])
@@ -1130,7 +1099,6 @@ class EnhancedChessApp:
         return chosen[0]
 
     def _apply_move_with_promotion(self, start_pos, end_pos, promo_cls):
-        """Executes move on board, applying promotion type if selected."""
         try:
             self.board.make_move(start_pos, end_pos, promo_cls)
         except TypeError:
@@ -1152,7 +1120,6 @@ class EnhancedChessApp:
             is_start_pos
         )
 
-    # ------------------------------------------------------------------ Right-Click Drawings
     def on_right_click_start(self, event):
         if self.premove:
             self.premove = None
@@ -1197,7 +1164,6 @@ class EnhancedChessApp:
 
     def _draw_highlight(self, r, c, tags):
         x, y = self.board_to_canvas(r, c)
-        # Semi-transparent red highlight with slightly darker solid border
         self.canvas.create_rectangle(
             x, y, x + self.square_size, y + self.square_size,
             fill="#ff4444", stipple="gray50", outline="#cc0000", width=2, tags=tags)
@@ -1212,7 +1178,6 @@ class EnhancedChessApp:
         if d == 0: 
             return
             
-        # Add gaps from exact center so it respects the piece location nicely
         gap = self.square_size * 0.3
         
         if d > gap * 2:
@@ -1230,7 +1195,6 @@ class EnhancedChessApp:
                 arrowshape=(aw * 2.5, aw * 3, aw * 1.2), 
                 capstyle=tk.ROUND, joinstyle=tk.ROUND, tags=tags)
 
-    # ------------------------------------------------------------------ resets and modes
     def clear_hash_manually(self):
         self._force_clear_hash = True
         self._stop_ai_process(invalidate_task=True)
@@ -1293,16 +1257,13 @@ class EnhancedChessApp:
             self._start_ai_process(bot_class, bot_name, self.bot_depth_slider.get())
 
     def update_ui_after_state_change(self):
-        # Preserve active drag state if user is currently holding a piece mid-turn change
         if self.dragging and self.drag_start:
             r, c = self.drag_start
             piece = self.board.grid[r][c]
             if piece and piece.color == self.turn:
-                # Piece still exists and it is now our turn: update valid moves to current position
                 self.valid_moves = get_all_legal_moves(self.board, self.turn)
                 self.valid_moves_for_highlight = [e for s, e in self.valid_moves if s == self.selected]
             else:
-                # Piece was captured by the incoming move: cancel drag
                 self.dragging = False
                 self.drag_start = None
                 self.selected = None
@@ -1366,7 +1327,6 @@ class EnhancedChessApp:
                 GameMode.HUMAN_VS_HUMAN.value: "Human vs Human Analysis"}.get(self.game_mode.get())
         self.game_info_label.config(text=text)
 
-    # ------------------------------------------------------------------ board drawing
     def create_board_image(self):
         if self.square_size <= 0:
             return None
@@ -1394,7 +1354,6 @@ class EnhancedChessApp:
             self.canvas.create_rectangle(2, 2, w - 2, h - 2, outline=self.COLORS['warning'],
                                          width=4, tags="border_highlight")
                                          
-        # Selected square highlight (instant visual feedback on click/drag)
         if self.selected:
             sx, sy = self.board_to_canvas(*self.selected)
             self.canvas.create_rectangle(
@@ -1405,14 +1364,13 @@ class EnhancedChessApp:
 
         # Queued premove start and end square highlights
         if self.premove:
-            for pr, pc in self.premove:
+            for pr, pc in (self.premove[0], self.premove[1]):
                 px, py = self.board_to_canvas(pr, pc)
                 self.canvas.create_rectangle(
                     px, py, px + self.square_size, py + self.square_size,
                     fill="#8338ec", stipple="gray50", outline="#c77dff", width=2, tags="highlight"
                 )
 
-        # Destination dots
         dot_color = "#8338ec" if (self.turn != self.human_color and self.game_mode.get() == GameMode.HUMAN_VS_BOT.value) else "#1E90FF"
         for r_m, c_m in getattr(self, 'valid_moves_for_highlight', []):
             x1, y1 = self.board_to_canvas(r_m, c_m)
@@ -1457,7 +1415,6 @@ class EnhancedChessApp:
                                             fill="#000000" if piece.color == "black" else "#FFFFFF",
                                             tags="piece")
                                             
-        # Draw custom arrows over pieces
         for (r1, c1), (r2, c2) in self.custom_arrows:
             self._draw_arrow(r1, c1, r2, c2, tags="custom_arrow")
             
@@ -1497,10 +1454,9 @@ class EnhancedChessApp:
         self.eval_bar_canvas.create_line(mx,   0, mx,   h, fill="#FF0000", width=3, tags="marker")
         self.eval_bar_canvas.create_line(w//2, 0, w//2, h, fill="#00FF00", width=2, tags="marker")
         sfx = f" (D{depth})" if depth is not None else ""
-        self.eval_score_label.config(text=f"Even{sfx}" if abs(score) < 0.05
+        self.eval_score_label.config(text=f"Even{sfx}" if abs(score) < 0.005
                                      else f"{'+' if score > 0 else ''}{score:.2f}{sfx}")
 
-    # ------------------------------------------------------------------ comm queue / PV
     def process_comm_queue(self):
         if self._shutting_down:
             return
@@ -1541,7 +1497,6 @@ class EnhancedChessApp:
                     if self._analysis_output_enabled():
                         self._render_pv()
                 elif kind == 'move':
-                    # Only accept the move if it matches the current generation ID
                     if self.active_worker_name is not None and msg_task_id == self.current_task_id:
                         if self.auto_save_stats_var.get() and self.game_mode.get() == GameMode.AI_VS_AI.value:
                             for bot, stat in self._pending_move_stat.items():
@@ -1585,9 +1540,7 @@ class EnhancedChessApp:
             self.pv_text.insert(tk.END, self._format_san_display(san) + " ", tag)
         self.pv_text.config(state=tk.DISABLED)
 
-    # ------------------------------------------------------------------ AI process
     def _start_ai_process(self, bot_class, bot_name, search_depth):
-        """Submit a task to the appropriate persistent worker."""
         if self.active_worker_name is not None:
             return   
 
@@ -1596,7 +1549,7 @@ class EnhancedChessApp:
                     if self.use_clock_var.get() else None) if not is_analysis else None
         inc = (self.increment if self.use_clock_var.get() else None) if not is_analysis else None
 
-        self.current_task_id += 1  # Increment task generation
+        self.current_task_id += 1
 
         task = {
             'board':            self.board.clone(),
@@ -1613,7 +1566,7 @@ class EnhancedChessApp:
             'clear_hash':       getattr(self, '_force_clear_hash', False),
             'task_id':          self.current_task_id
         }
-        self._force_clear_hash = False  # Reset flag after consuming
+        self._force_clear_hash = False
 
         self.analysis_thinking = (bot_name == self.ANALYSIS_AI_NAME)
 
@@ -1629,7 +1582,6 @@ class EnhancedChessApp:
         self.update_bot_labels()
 
     def _stop_ai_process(self, drain_queue=True, invalidate_task=True):
-        """Cancel the current task (worker stays alive)."""
         if self.active_worker_name == 'main':
             self.main_cancel_event.set()
         elif self.active_worker_name == 'op':
@@ -1641,7 +1593,6 @@ class EnhancedChessApp:
         self.active_worker_name = None
         self.analysis_thinking  = False
 
-        # Drain any messages already in the queue from the cancelled task.
         if drain_queue:
             while not self.comm_queue.empty():
                 try:
@@ -1674,7 +1625,6 @@ class EnhancedChessApp:
             print(f"\n--- Analysis: Move {fullmove}, Ply {self.history_pointer}, {self.turn.capitalize()} ---")
             self.master.after(50, lambda: self._start_ai_process(ChessBot, self.ANALYSIS_AI_NAME, 99))
 
-    # ------------------------------------------------------------------ misc helpers
     def _update_time_control_label(self):
         t = int(self.time_control_seconds.get())
         self.time_control_label.config(text=f"Time Control: {t // 60:02d}:{t % 60:02d}")
@@ -1747,9 +1697,13 @@ class EnhancedChessApp:
     def handle_timeout(self, color):
         self.game_over     = True
         self.clock_running = False
-        self.game_result   = ('timeout', 'black' if color == 'white' else 'white')
+        opp_color = 'black' if color == 'white' else 'white'
+        if is_insufficient_material(self.board):
+            self.game_result = ('timeout_draw', None)
+        else:
+            self.game_result = ('timeout', opp_color)
         self.update_ui_after_state_change()
-        print("Game Over! Result: timeout")
+        print(f"Game Over! Result: {self.game_result[0]}")
         self._stop_ai_process()
         if self.game_mode.get() == GameMode.AI_VS_AI.value and self.ai_series_running:
             self.process_ai_series_result()
@@ -1762,6 +1716,10 @@ class EnhancedChessApp:
                 self.turn_label.config(
                     text=f"⌛ OUT OF TIME: {loser.upper()} LOST",
                     background="#8B0000", foreground="#FFFFFF")
+            elif res == "timeout_draw":
+                self.turn_label.config(
+                    text="⌛ TIMEOUT: DRAW (INSUFFICIENT MATERIAL)",
+                    background=self.COLORS['bg_light'], foreground=self.COLORS['text_light'])
             elif res == "checkmate":
                 self.turn_label.config(
                     text=f"★ CHECKMATE: {winner.upper()} WINS",
@@ -1820,7 +1778,6 @@ class EnhancedChessApp:
         return (r, c) if 0 <= r < ROWS and 0 <= c < COLS else (-1, -1)
 
     def show_readme_popup(self):
-        """Creates a dark-themed scrollable popup rendering Zreadme.txt."""
         popup = tk.Toplevel(self.master)
         popup.title("Standard Chess - Rules & Reference")
         popup.geometry("800x700")
@@ -1828,13 +1785,11 @@ class EnhancedChessApp:
         popup.transient(self.master)
         popup.grab_set()
 
-        # Center popup on master window
         popup.update_idletasks()
         mx = self.master.winfo_x() + (self.master.winfo_width() - 800) // 2
         my = self.master.winfo_y() + (self.master.winfo_height() - 700) // 2
         popup.geometry(f"800x700+{mx}+{my}")
 
-        # Scrollable Text Container Frame
         text_frame = tk.Frame(popup, bg=self.COLORS['bg_medium'])
         text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(20, 15))
 
@@ -1848,7 +1803,6 @@ class EnhancedChessApp:
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=text.yview)
 
-        # Custom Styling Tags for a styled markdown look
         text.tag_config("title", foreground=self.COLORS['accent'], font=("Helvetica", 18, "bold"), spacing1=10, spacing2=5)
         text.tag_config("h2", foreground=self.COLORS['text_light'], font=("Helvetica", 14, "bold"), spacing1=15, spacing2=5)
         text.tag_config("h3", foreground=self.COLORS['text_light'], font=("Helvetica", 12, "bold"), spacing1=10, spacing2=5)
@@ -1856,14 +1810,12 @@ class EnhancedChessApp:
         text.tag_config("bold", font=("Helvetica", 11, "bold"))
         text.tag_config("normal", font=("Helvetica", 11), spacing3=4)
 
-        # Read the file
         try:
             with open("Zreadme.txt", "r", encoding="utf-8") as f:
                 readme_text = f.read()
         except FileNotFoundError:
             readme_text = "# Error\nCould not find `Zreadme.txt` in the current directory."
 
-        # Parse and insert text
         lines = readme_text.split('\n')
         in_code_block = False
 
@@ -1886,7 +1838,6 @@ class EnhancedChessApp:
             elif line.startswith("---"):
                 text.insert(tk.END, "─" * 60 + "\n", "normal")
             else:
-                # Parse inline bold and code tags within standard sentences
                 parts = re.split(r'(`[^`]+`)', line)
                 for part in parts:
                     if part.startswith('`') and part.endswith('`'):
@@ -1902,11 +1853,9 @@ class EnhancedChessApp:
 
         text.config(state=tk.DISABLED)
 
-        # Got It button
         close_btn = ttk.Button(popup, text="Close", command=popup.destroy, style='Control.TButton')
         close_btn.pack(pady=(0, 15))
 
-        # Bind Escape to close
         popup.bind("<Escape>", lambda e: popup.destroy())
 
     def undo_move(self):   self._navigate_history(self.history_pointer - 1)
@@ -1926,7 +1875,6 @@ class EnhancedChessApp:
         self.redo_button .config(state=tk.NORMAL if can_fwd  else tk.DISABLED)
         self.end_button  .config(state=tk.NORMAL if can_fwd  else tk.DISABLED)
 
-    # ------------------------------------------------------------------ AI series
     def process_ai_series_result(self):
         self.ai_series_stats['game_count'] += 1
         _, wc = self.game_result
@@ -1998,7 +1946,6 @@ class EnhancedChessApp:
             total_series_games=self.AI_SERIES_GAMES,
         )
 
-    # ------------------------------------------------------------------ Delegated Events
     def _on_pv_text_motion(self, event):
         index = self.pv_text.index(f"@{event.x},{event.y}")
         tags = self.pv_text.tag_names(index)
@@ -2032,7 +1979,6 @@ class EnhancedChessApp:
         else:
             self.moves_text.config(cursor="arrow")
 
-    # ------------------------------------------------------------------ PV hover mini-board
     def on_pv_hover_enter(self, event, move_idx, tag):
         self.pv_text.tag_config(tag, background=self.COLORS['accent'],
                                 foreground=self.COLORS['text_light'])
@@ -2088,7 +2034,6 @@ class EnhancedChessApp:
                     self.tt_canvas.create_text(x1 + sq // 2, y1 + sq // 2 + 1,
                                                text=sym, font=font,
                                                fill="#000" if piece.color == "black" else "#FFF")
-
 
 if __name__ == "__main__":
     mp.freeze_support()

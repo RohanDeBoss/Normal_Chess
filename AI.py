@@ -1,24 +1,5 @@
-# AI.py (v1.3 - PyPy port: array-backed TT/eval-cache, no full-table resets)
-#
-# Changelog vs v1.2:
-#   - self.tt and self.eval_tt were plain dicts that got thrown away and
-#     rebuilt from scratch (`self.tt = {}`) whenever they hit their size
-#     cap. Under PyPy that's a JIT trace-breaker: every reset invalidates
-#     the specialized dict-access traces the JIT had built up over the
-#     previous few million lookups, so search briefly runs at
-#     interpreter speed again right after every clear.
-#   - Both are now fixed-size arrays (Python lists of primitives / a
-#     bytearray) sized as a power of two, addressed with `hash & MASK`
-#     instead of dict hashing. No resizing, no full clears, and
-#     list-of-primitives indexing is exactly the access pattern PyPy's
-#     JIT specializes best.
-#   - TTEntry (the namedtuple record) is no longer used by ChessBot;
-#     replaced by parallel arrays (tt_keys/tt_scores/tt_depths/
-#     tt_flags/tt_moves/tt_ages) plus a running tt_filled counter for
-#     the TT-fullness readout. TT_FLAG_* constants are unchanged and
-#     still shared via EngineRuntime.
-#   - get_pv_data() in EngineRuntime.py was updated to match (reads the
-#     new array-backed TT via bot._tt_probe / bot.tt_moves).
+# AI.py (v1.5 - PyPy port: array-backed TT/eval-cache, no full-table resets + bug fixes to TT + tempo bonus)
+
 
 import time
 import random
@@ -130,13 +111,14 @@ class ChessBot:
 
     MAX_EXTENSION_DEPTH = 16
 
+    TEMPO_BONUS = 20
     EVAL_BISHOP_PAIR = 30
     EVAL_ROOK_OPEN_FILE = 20
     EVAL_ROOK_SEMI_OPEN = 10
     EVAL_PASSED_PAWN_RANK = [0, 5, 10, 20, 35, 60, 100, 0]
 
     def __init__(self, board, color, position_counts, comm_queue, cancellation_event,
-                 bot_name=None, ply_count=0, game_mode="bot", max_moves=200,
+                 bot_name=None, ply_count=0, game_mode="bot",
                  time_left=None, increment=None, use_opening_book=True,
                  show_tt_fullness=False):
         self.show_tt_fullness = show_tt_fullness
@@ -149,7 +131,6 @@ class ChessBot:
         self.cancellation_event = cancellation_event
         self.ply_count = ply_count
         self.game_mode = game_mode
-        self.max_moves = max_moves
 
         self.time_left = time_left
         self.increment = increment
@@ -195,7 +176,7 @@ class ChessBot:
         self.nodes_searched = 0
         self.used_heuristic_eval = False
         self.tb_hits = 0
-        self.killer_moves = [[None, None] for _ in range(max(200, self.max_moves))]
+        self.killer_moves = [[None, None] for _ in range(256)]
         self.history_heuristic_table = [[[0 for _ in range(64)] for _ in range(64)] for _ in range(2)]
         self.counter_moves = [[[None for _ in range(64)] for _ in range(64)] for _ in range(2)]
         # [color][prev_piece_type][prev_to_sq][my_piece_type][my_to_sq]
@@ -244,6 +225,9 @@ class ChessBot:
     def _store_tt(self, hash_val, score, depth, flag, move):
         idx = hash_val & self.TT_MASK
         stored_depth = self.tt_depths[idx]
+        
+        # Check if the slot currently holds the EXACT same position
+        same_position = (stored_depth != -1 and self.tt_keys[idx] == hash_val)
 
         # Age-based replacement: overwrite if the slot is empty, from an
         # older turn, or this search went deeper than what's stored.
@@ -254,7 +238,17 @@ class ChessBot:
             self.tt_scores[idx] = score
             self.tt_depths[idx] = depth
             self.tt_flags[idx]  = flag
-            self.tt_moves[idx]  = move if move is not None else self.tt_moves[idx]
+            
+            # CRITICAL FIX: Only inherit the old move if it's a fail-low (move is None) 
+            # AND we are updating the SAME position. Otherwise, a hash collision would 
+            # cause this position to inherit a garbage move from an unrelated position.
+            if move is not None:
+                self.tt_moves[idx] = move
+            elif same_position:
+                pass # Keep existing self.tt_moves[idx]
+            else:
+                self.tt_moves[idx] = None
+                
             self.tt_ages[idx]   = self.current_age
 
     def _report_log(self, message):   self.comm_queue.put(('log', message))
@@ -511,6 +505,9 @@ class ChessBot:
             alpha = -float('inf')
             beta  =  float('inf')
 
+        orig_alpha = alpha
+        orig_beta = beta
+
         ordered_root_moves = self.order_moves(self.board, root_moves, 0, pv_move, self.color)
         board = self.board
 
@@ -551,7 +548,13 @@ class ChessBot:
                 alpha = best_score_this_iter
 
         if best_move_this_iter is not None:
-            self._store_tt(root_hash, best_score_this_iter, depth, TT_FLAG_EXACT, best_move_this_iter)
+            if best_score_this_iter <= orig_alpha:
+                tt_flag = TT_FLAG_UPPERBOUND
+            elif best_score_this_iter >= orig_beta:
+                tt_flag = TT_FLAG_LOWERBOUND
+            else:
+                tt_flag = TT_FLAG_EXACT
+            self._store_tt(root_hash, best_score_this_iter, depth, tt_flag, best_move_this_iter)
 
         return best_score_this_iter, best_move_this_iter
 
@@ -570,11 +573,17 @@ class ChessBot:
             if hash_val in search_path:
                 return self.DRAW_SCORE
 
-        if is_insufficient_material(board) or board.halfmove_clock >= 100 or self.ply_count + ply >= self.max_moves:
+        if is_insufficient_material(board) or board.halfmove_clock >= 100:
             return self.DRAW_SCORE
 
         original_alpha = alpha
         tt_idx = self._tt_probe(hash_val)
+        
+        # CRITICAL FIX: Capture hash_move IMMEDIATELY. If we wait until after 
+        # recursive calls (like Null Move Pruning), a deep sub-search might 
+        # overwrite this exact TT slot with a different position's data.
+        hash_move = self.tt_moves[tt_idx] if tt_idx != -1 else None
+        
         # NOTE (v127.1): the old "stale TT repetition guard" that used to sit
         # here existed only to cover position_counts == 1 nodes; those now
         # return DRAW_SCORE above before the TT is ever consulted, so the
@@ -671,7 +680,6 @@ class ChessBot:
             # per-move own-king-in-check test below has been removed entirely
             # — this was the single biggest hot-loop cost in the old search.
             legal_moves = get_all_legal_moves(board, turn)
-            hash_move   = self.tt_moves[tt_idx] if tt_idx != -1 else None
 
             # --- INTERNAL ITERATIVE REDUCTION (IIR) ---
             # If we don't have a TT move to guide us, move ordering will be suboptimal.
@@ -858,7 +866,7 @@ class ChessBot:
             candidate_moves = get_all_legal_moves(board, turn)
             scored_moves = []
             for move in candidate_moves:
-                (r1, c1), (r2, c2) = move
+                (r1, c1), (r2, c2) = move[:2]
                 moving_piece = grid[r1][c1]
                 target_piece = grid[r2][c2]
                 swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
@@ -884,17 +892,17 @@ class ChessBot:
                 return -self.MATE_SCORE + ply
             return best_score
 
-        # --- Not in check: standard tactical-only quiescence (unchanged) ---
+        # --- Not in check: standard tactical-only quiescence ---
         stand_pat = self._get_cached_static_eval(board, turn, hash_val)
         best_score = stand_pat
         if stand_pat >= beta: return stand_pat
         if stand_pat > alpha: alpha = stand_pat
 
-        promising_moves = get_all_pseudo_legal_moves(board, turn)
+        promising_moves = get_all_legal_moves(board, turn)
         scored_moves = []
 
         for move in promising_moves:
-            (r1, c1), (r2, c2) = move
+            (r1, c1), (r2, c2) = move[:2]
             moving_piece = grid[r1][c1]
             target_piece = grid[r2][c2]
 
@@ -910,11 +918,6 @@ class ChessBot:
 
         for score, move in scored_moves:
             record = board.make_move_track(move[0], move[1])
-
-            if is_in_check(board, turn):
-                board.unmake_move(record)
-                continue
-
             child_hash = incremental_hash(hash_val, record)
             search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
             board.unmake_move(record)
@@ -938,7 +941,7 @@ class ChessBot:
         k2 = killers[1] if killers else None
 
         for move in moves:
-            (r1, c1), (r2, c2) = move
+            (r1, c1), (r2, c2) = move[:2]
             moving_piece = grid[r1][c1]
             target_piece = grid[r2][c2]
 
@@ -1059,7 +1062,8 @@ class ChessBot:
         eg_score    = scores_eg[0] - scores_eg[1]
         final_score = (mg_score * phase + eg_score * inv_phase) >> 8
 
-        return final_score if turn_to_move == 'white' else -final_score
+        eval_side = final_score if turn_to_move == 'white' else -final_score
+        return eval_side + self.TEMPO_BONUS
 
 
 # --- Standard Chess Piece-Square Tables ---

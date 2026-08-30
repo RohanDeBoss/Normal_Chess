@@ -1,26 +1,4 @@
 # MoveChecker.py (v1.1 - parallel Perft via ProcessPoolExecutor across root moves)
-#
-# Changelog vs v1.0:
-#   - Perft used to run all root moves sequentially on one background
-#     thread. Every root move's subtree is fully independent (no shared
-#     alpha-beta bounds, no shared mutable state once the move's
-#     applied), so it's an embarrassingly parallel problem: dividing
-#     the root moves across a ProcessPoolExecutor scales throughput
-#     with core count instead of running on a single core.
-#   - _perft_rec() and the per-root-move task function were pulled out
-#     to module level so they're picklable/importable by worker
-#     processes — a closure defined inside launch_move_checker_dialog()
-#     can't be sent to a ProcessPoolExecutor.
-#   - Below depth 3, falls back to the old sequential loop: spinning up
-#     a process pool costs more in startup time than a depth-1/2 Perft
-#     (tens to low-hundreds of nodes) takes to run outright.
-#   - The Cancel button now also forcibly terminates any worker
-#     processes already mid-computation (see _shutdown_executor_now),
-#     since a ProcessPoolExecutor can't cooperatively cancel a task
-#     that's already running.
-#   - The outer dialog/thread architecture (background thread submits
-#     work, polls for completions, posts UI updates via master.after)
-#     is unchanged.
 
 import os
 import time

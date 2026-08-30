@@ -6,6 +6,7 @@ import math
 import random
 import time
 import re
+import threading
 from GameLogic import *
 from AI import ChessBot, board_hash
 from OpponentAI import OpponentAI
@@ -17,6 +18,7 @@ from EngineRuntime import (
     strip_casualties,
     board_to_fen,
 )
+from MoveChecker import launch_move_checker_dialog
 from enum import Enum
 import multiprocessing as mp
 
@@ -1137,52 +1139,18 @@ class EnhancedChessApp:
                 self.board.grid[end_pos[0]][end_pos[1]] = promo_cls(self.turn)
 
     def run_move_checker(self):
-        """Validates starting position legal move count against standard chess rules."""
-        test_board = Board()
-        d1_moves = get_all_legal_moves(test_board, "white")
-        d1_count = len(d1_moves)
-
-        # Depth 2 Perft calculation (20 x 20 = 400 expected)
-        d2_count = 0
-        for m in d1_moves:
-            b_clone = test_board.clone()
-            b_clone.make_move(m[0], m[1])
-            d2_moves = get_all_legal_moves(b_clone, "black")
-            d2_count += len(d2_moves)
-
-        d1_expected = 20
-        d2_expected = 400
-        d1_pass = (d1_count == d1_expected)
-        d2_pass = (d2_count == d2_expected)
-
-        details = (
-            f"--- START POSITION PERFT CHECK ---\n"
-            f"Depth 1 Legal Moves: {d1_count} (Expected: {d1_expected}) -> {'PASS [OK]' if d1_pass else 'FAIL [MISMATCH]'}\n"
-            f"Depth 2 Legal Moves: {d2_count} (Expected: {d2_expected}) -> {'PASS [OK]' if d2_pass else 'FAIL [MISMATCH]'}\n\n"
-            f"Depth 1 Moves Breakdown ({d1_count} total):\n"
+        depth = int(self.bot_depth_slider.get())
+        is_start_pos = (self.history_pointer <= 0 and self.turn == "white" and
+                        self.board.castling_rights == 15 and self.board.ep_square is None)
+        
+        launch_move_checker_dialog(
+            self.master, 
+            self.board.clone(), 
+            self.turn, 
+            depth, 
+            self.COLORS, 
+            is_start_pos
         )
-        for i, m in enumerate(d1_moves, 1):
-            child = test_board.clone()
-            child.make_move(m[0], m[1])
-            san = format_move_san(test_board, child, m)
-            details += f"  {i:2d}. {san.ljust(6)} ({m[0]} -> {m[1]})\n"
-
-        print("\n" + details)
-        if d1_pass and d2_pass:
-            messagebox.showinfo(
-                "Perft Rules Check Passed",
-                f"Standard Chess Rule Verification: SUCCESS!\n\n"
-                f"Depth 1: {d1_count}/{d1_expected} legal moves\n"
-                f"Depth 2: {d2_count}/{d2_expected} legal moves"
-            )
-        else:
-            messagebox.showerror(
-                "Perft Rules Check Failed",
-                f"MISMATCH DETECTED against standard chess!\n\n"
-                f"Depth 1: {d1_count} (Expected: {d1_expected})\n"
-                f"Depth 2: {d2_count} (Expected: {d2_expected})\n\n"
-                f"See terminal log for details."
-            )
 
     # ------------------------------------------------------------------ Right-Click Drawings
     def on_right_click_start(self, event):

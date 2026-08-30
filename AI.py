@@ -1,4 +1,24 @@
-# AI.py (v1.2 - fast legal move gen integrated into negamax + qsearch)
+# AI.py (v1.3 - PyPy port: array-backed TT/eval-cache, no full-table resets)
+#
+# Changelog vs v1.2:
+#   - self.tt and self.eval_tt were plain dicts that got thrown away and
+#     rebuilt from scratch (`self.tt = {}`) whenever they hit their size
+#     cap. Under PyPy that's a JIT trace-breaker: every reset invalidates
+#     the specialized dict-access traces the JIT had built up over the
+#     previous few million lookups, so search briefly runs at
+#     interpreter speed again right after every clear.
+#   - Both are now fixed-size arrays (Python lists of primitives / a
+#     bytearray) sized as a power of two, addressed with `hash & MASK`
+#     instead of dict hashing. No resizing, no full clears, and
+#     list-of-primitives indexing is exactly the access pattern PyPy's
+#     JIT specializes best.
+#   - TTEntry (the namedtuple record) is no longer used by ChessBot;
+#     replaced by parallel arrays (tt_keys/tt_scores/tt_depths/
+#     tt_flags/tt_moves/tt_ages) plus a running tt_filled counter for
+#     the TT-fullness readout. TT_FLAG_* constants are unchanged and
+#     still shared via EngineRuntime.
+#   - get_pv_data() in EngineRuntime.py was updated to match (reads the
+#     new array-backed TT via bot._tt_probe / bot.tt_moves).
 
 import time
 import random
@@ -11,7 +31,6 @@ from EngineRuntime import (
     TT_FLAG_EXACT,
     TT_FLAG_LOWERBOUND,
     TT_FLAG_UPPERBOUND,
-    TTEntry,
     board_hash,
     board_to_fen,
     build_flat_pst_tables,
@@ -56,8 +75,9 @@ INITIAL_PHASE_MATERIAL = (MG_PIECE_VALUES[Knight] * 4 + MG_PIECE_VALUES[Bishop] 
 # (Move packing helpers removed to eliminate inner-loop function overhead and ensure tuple consistency)
 
 # --- SEARCH STRUCTURES ---
-# TTEntry / TT_FLAG_* now live in EngineRuntime.py as shared, non-tunable
-# infrastructure — every bot subclass needs the exact same TT record format.
+# TT_FLAG_* live in EngineRuntime.py as shared, non-tunable infrastructure —
+# every bot subclass needs the exact same flag values. The actual table
+# storage (below) is array-backed per-instance state, not shared.
 
 
 class ChessBot:
@@ -83,8 +103,15 @@ class ChessBot:
     USE_IIR = True
     IIR_MIN_DEPTH = 4
 
-    TT_MAX_SIZE = 6_000_000
-    EVAL_TT_MAX_SIZE = 3_000_000
+    # Fixed-size, array-backed hash tables (see _initialize_search_state).
+    # Power-of-two sizes let slot lookup use a cheap bitmask (`& TT_MASK`)
+    # instead of a modulo or dict hash, and a fixed array never needs the
+    # "throw the whole table away and rebuild" eviction the old dict-based
+    # tables used at capacity.
+    TT_SIZE      = 1 << 22   # ~4.19M slots
+    TT_MASK      = TT_SIZE - 1
+    EVAL_TT_SIZE = 1 << 21   # ~2.10M slots
+    EVAL_TT_MASK = EVAL_TT_SIZE - 1
 
     BONUS_PV_MOVE = 10_000_000
     BONUS_CAPTURE = 8_000_000
@@ -144,8 +171,26 @@ class ChessBot:
         self._initialize_search_state()
 
     def _initialize_search_state(self):
-        self.tt = {}
-        self.eval_tt = {}
+        # --- Main search transposition table (array-backed) ---
+        # tt_depths[idx] == -1 marks an empty slot. A full hash-key
+        # compare (tt_keys[idx] == hash_val) guards against two different
+        # positions landing in the same bucket.
+        self.tt_keys   = [0] * self.TT_SIZE
+        self.tt_scores = [0] * self.TT_SIZE
+        self.tt_depths = [-1] * self.TT_SIZE
+        self.tt_flags  = [0] * self.TT_SIZE
+        self.tt_moves  = [None] * self.TT_SIZE
+        self.tt_ages   = [0] * self.TT_SIZE
+        self.tt_filled = 0   # running count of occupied slots, for the TT% readout
+
+        # --- Static-eval cache (array-backed) ---
+        # Always-replace scheme: static eval is cheap enough, and purely a
+        # function of (board, turn), that there's no need for depth-based
+        # keep-or-overwrite logic like the main TT has.
+        self.eval_tt_keys = [0] * self.EVAL_TT_SIZE
+        self.eval_tt_vals = [0] * self.EVAL_TT_SIZE
+        self.eval_tt_occ  = bytearray(self.EVAL_TT_SIZE)
+
         self.current_age = 0
         self.nodes_searched = 0
         self.used_heuristic_eval = False
@@ -163,32 +208,54 @@ class ChessBot:
             bot_name, ply_count, game_mode, **kwargs
         )
 
+    def _tt_probe(self, hash_val):
+        """Returns the slot index if hash_val is resident, else -1. Checks
+        the empty-sentinel first (cheap) then the full key (guards against
+        a same-bucket collision being mistaken for a hit)."""
+        idx = hash_val & self.TT_MASK
+        if self.tt_depths[idx] != -1 and self.tt_keys[idx] == hash_val:
+            return idx
+        return -1
+
+    def _peek_eval_tt(self, hash_val):
+        """Non-computing eval-cache lookup: returns the cached value or
+        None without ever calling evaluate_board. Used by pruning paths
+        that only want to act on an eval if one's already been paid for."""
+        idx = hash_val & self.EVAL_TT_MASK
+        if self.eval_tt_occ[idx] and self.eval_tt_keys[idx] == hash_val:
+            return self.eval_tt_vals[idx]
+        return None
+
     def _get_cached_static_eval(self, board, turn, hash_val):
         """
         Static eval is purely a function of (board, turn) — no depth or alpha/beta
         dependence — so it's safe to cache and reuse across any node that
         transposes to the same position, exactly like qsearch's stand_pat cache.
         """
-        cached = self.eval_tt.get(hash_val)
-        if cached is not None:
-            return cached
+        idx = hash_val & self.EVAL_TT_MASK
+        if self.eval_tt_occ[idx] and self.eval_tt_keys[idx] == hash_val:
+            return self.eval_tt_vals[idx]
         val = self.evaluate_board(board, turn)
-        if len(self.eval_tt) > self.EVAL_TT_MAX_SIZE:
-            # Refcount drops to 0 instantly. Python reuses this memory for new entries!
-            self.eval_tt = {}
-        self.eval_tt[hash_val] = val
+        self.eval_tt_keys[idx] = hash_val
+        self.eval_tt_vals[idx] = val
+        self.eval_tt_occ[idx]  = 1
         return val
 
     def _store_tt(self, hash_val, score, depth, flag, move):
-        existing = self.tt.get(hash_val)
-        if len(self.tt) > self.TT_MAX_SIZE:
-            self.tt = {}   # <--- INSTANT MEMORY RELEASE
-            existing = None
-            
-        # Age-based replacement: Overwrite if slot is empty, from an older turn, or searched deeper
-        if not existing or existing.age < self.current_age or depth >= existing.depth:
-            best_move = move if move is not None else (existing.best_move if existing else None)
-            self.tt[hash_val] = TTEntry(score, depth, flag, best_move, self.current_age)
+        idx = hash_val & self.TT_MASK
+        stored_depth = self.tt_depths[idx]
+
+        # Age-based replacement: overwrite if the slot is empty, from an
+        # older turn, or this search went deeper than what's stored.
+        if stored_depth == -1 or self.tt_ages[idx] < self.current_age or depth >= stored_depth:
+            if stored_depth == -1:
+                self.tt_filled += 1
+            self.tt_keys[idx]   = hash_val
+            self.tt_scores[idx] = score
+            self.tt_depths[idx] = depth
+            self.tt_flags[idx]  = flag
+            self.tt_moves[idx]  = move if move is not None else self.tt_moves[idx]
+            self.tt_ages[idx]   = self.current_age
 
     def _report_log(self, message):   self.comm_queue.put(('log', message))
     def _report_eval(self, score, depth): self.comm_queue.put(('eval', score if self.color == 'white' else -score, depth))
@@ -351,7 +418,7 @@ class ChessBot:
                 knps              = (self.nodes_searched / iter_duration / 1000) if iter_duration > 0 else 0
 
                 eval_for_ui = best_score_this_iter if self.color == 'white' else -best_score_this_iter
-                tt_str = f", TT={int((len(self.tt) / self.TT_MAX_SIZE) * 1000)}/1000" if getattr(self, 'show_tt_fullness', False) else ""
+                tt_str = f", TT={int((self.tt_filled / self.TT_SIZE) * 1000)}/1000" if getattr(self, 'show_tt_fullness', False) else ""
                 self._report_log(f"  > {self.bot_name} (D{current_depth}): {self._format_move(self.board, best_move_this_iter)}, Eval={eval_for_ui/100:+.2f}, NodesTotal={total_nodes}, KNPS={knps:.1f}{tt_str}, Time={iter_duration:.2f}s")
                 self._report_eval(best_score_this_iter, current_depth)
 
@@ -415,7 +482,7 @@ class ChessBot:
                     knps              = (self.nodes_searched / iter_duration / 1000) if iter_duration > 0 else 0
 
                     eval_for_ui = best_score_this_iter if self.color == 'white' else -best_score_this_iter
-                    tt_str = f", TT={int((len(self.tt) / self.TT_MAX_SIZE) * 1000)}/1000" if getattr(self, 'show_tt_fullness', False) else ""
+                    tt_str = f", TT={int((self.tt_filled / self.TT_SIZE) * 1000)}/1000" if getattr(self, 'show_tt_fullness', False) else ""
                     self._report_log(f"  > {self.bot_name} (D{current_depth}): {self._format_move(self.board, best_move_this_iter)}, Eval={eval_for_ui/100:+.2f}, NodesTotal={total_nodes}, KNPS={knps:.1f}{tt_str}, Time={iter_duration:.2f}s")
                     self._report_eval(best_score_this_iter, current_depth)
 
@@ -507,24 +574,25 @@ class ChessBot:
             return self.DRAW_SCORE
 
         original_alpha = alpha
-        tt_entry = self.tt.get(hash_val)
+        tt_idx = self._tt_probe(hash_val)
         # NOTE (v127.1): the old "stale TT repetition guard" that used to sit
         # here existed only to cover position_counts == 1 nodes; those now
         # return DRAW_SCORE above before the TT is ever consulted, so the
         # guard became unreachable dead code and has been removed.
 
-        if ply > 0 and tt_entry and tt_entry.depth >= depth:
-            tt_score = tt_entry.score
+        if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth:
+            tt_score = self.tt_scores[tt_idx]
             if tt_score >  self.MATE_SCORE - 1000: tt_score -= ply
             elif tt_score < -self.MATE_SCORE + 1000: tt_score += ply
 
             self.used_heuristic_eval = True
 
-            if tt_entry.flag == TT_FLAG_EXACT:
+            tt_flag = self.tt_flags[tt_idx]
+            if tt_flag == TT_FLAG_EXACT:
                 return tt_score
-            elif tt_entry.flag == TT_FLAG_LOWERBOUND:
+            elif tt_flag == TT_FLAG_LOWERBOUND:
                 if tt_score > alpha: alpha = tt_score
-            elif tt_entry.flag == TT_FLAG_UPPERBOUND:
+            elif tt_flag == TT_FLAG_UPPERBOUND:
                 if tt_score < beta: beta = tt_score
             if alpha >= beta: return tt_score
 
@@ -547,12 +615,12 @@ class ChessBot:
         try:
             # --- LAZY REVERSE FUTILITY PRUNING (Python-Optimized) ---
             # Instead of calling evaluate_board() and tanking KNPS, we ONLY prune
-            # if the static eval was already computed and cached in the TT.
-            # This provides the Elo benefits of RFP at literally zero CPU cost.
+            # if the static eval was already computed and cached. This provides
+            # the Elo benefits of RFP at literally zero extra CPU cost.
             if (self.USE_REVERSE_FUTILITY_PRUNING and depth <= self.RFP_MAX_DEPTH and
                     not is_in_check_flag and ply > 0 and abs(beta) < self.MATE_SCORE - 1000
                     and total_pieces > 6):
-                static_eval = self.eval_tt.get(hash_val)
+                static_eval = self._peek_eval_tt(hash_val)
                 if static_eval is not None:
                     rfp_margin = self.RFP_MARGIN_PER_DEPTH * depth
                     if static_eval - rfp_margin >= beta:
@@ -603,7 +671,7 @@ class ChessBot:
             # per-move own-king-in-check test below has been removed entirely
             # — this was the single biggest hot-loop cost in the old search.
             legal_moves = get_all_legal_moves(board, turn)
-            hash_move   = tt_entry.best_move if tt_entry else None
+            hash_move   = self.tt_moves[tt_idx] if tt_idx != -1 else None
 
             # --- INTERNAL ITERATIVE REDUCTION (IIR) ---
             # If we don't have a TT move to guide us, move ordering will be suboptimal.
@@ -757,14 +825,15 @@ class ChessBot:
         if ply > 0 and hash_val in self.position_counts:
             return self.DRAW_SCORE
 
-        tt_entry = self.tt.get(hash_val)
-        if tt_entry:
-            tt_score = tt_entry.score
+        tt_idx = self._tt_probe(hash_val)
+        if tt_idx != -1:
+            tt_score = self.tt_scores[tt_idx]
             if tt_score > self.MATE_SCORE - 1000: tt_score -= ply
             elif tt_score < -self.MATE_SCORE + 1000: tt_score += ply
-            if tt_entry.flag == TT_FLAG_EXACT: return tt_score
-            if tt_entry.flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
-            if tt_entry.flag == TT_FLAG_UPPERBOUND and tt_score <= alpha: return tt_score
+            tt_flag = self.tt_flags[tt_idx]
+            if tt_flag == TT_FLAG_EXACT: return tt_score
+            if tt_flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
+            if tt_flag == TT_FLAG_UPPERBOUND and tt_score <= alpha: return tt_score
 
         if is_insufficient_material(board): return self.DRAW_SCORE
 
@@ -776,7 +845,7 @@ class ChessBot:
         is_in_check_flag = is_in_check(board, turn)
         best_score = -float('inf')
         opponent_turn = 'black' if turn == 'white' else 'white'
-        tt_move = tt_entry.best_move if tt_entry else None
+        tt_move = self.tt_moves[tt_idx] if tt_idx != -1 else None
         grid = board.grid
 
         if is_in_check_flag:

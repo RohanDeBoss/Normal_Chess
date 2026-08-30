@@ -1,8 +1,21 @@
-# EngineRuntime.py (v1.4 - standard chess hashing/FEN, tablebase removed)
+# EngineRuntime.py (v1.5 - PyPy port: JIT warmup on worker boot, array-TT-aware get_pv_data)
+#
+# Changelog vs v1.4:
+#   - Added _jit_warmup(), called once at the top of persistent_worker()
+#     before the first real task is pulled off the queue. Runs a
+#     throwaway low-depth search so PyPy's JIT compiles the hot
+#     negamax/qsearch/order_moves loops during worker startup instead of
+#     during the player's first real move.
+#   - get_pv_data() previously read AI.py's search table via
+#     bot.tt.get(h) (dict-based TTEntry). AI.py's ChessBot now stores
+#     the table as arrays (see AI.py v1.3), so this reads it via
+#     bot._tt_probe(h) / bot.tt_moves[idx] instead.
+#   - Added Board and multiprocessing imports needed by _jit_warmup.
 
 import glob
 import inspect
 import json
+import multiprocessing as mp
 import os
 import random
 import re
@@ -10,7 +23,7 @@ import traceback
 from collections import namedtuple
 
 from GameLogic import (
-    ROWS, COLS, Pawn, Knight, Bishop, Rook, Queen, King,
+    ROWS, COLS, Pawn, Knight, Bishop, Rook, Queen, King, Board,
     format_move_san, get_all_legal_moves,
 )
 
@@ -68,23 +81,23 @@ def board_hash(board, turn):
 
 
 def incremental_hash(parent_hash, record_tuple):
-    start, end, mp, removed, added, old_c, old_ep, _, special, new_c, new_ep = record_tuple
+    start, end, mp_piece, removed, added, old_c, old_ep, _, special, new_c, new_ep = record_tuple
     h = parent_hash ^ ZOBRIST_TURN
     arr = ZOBRIST_ARRAY
-    c_idx = 0 if mp.color == "white" else 1
+    c_idx = 0 if mp_piece.color == "white" else 1
 
     # Remove moving piece from start
-    h ^= arr[c_idx][mp.z_idx][start[0]][start[1]]
+    h ^= arr[c_idx][mp_piece.z_idx][start[0]][start[1]]
 
     # Place piece on destination (Queen if promoted)
     if special == 3:
         h ^= arr[c_idx][4][end[0]][end[1]]
     else:
-        h ^= arr[c_idx][mp.z_idx][end[0]][end[1]]
+        h ^= arr[c_idx][mp_piece.z_idx][end[0]][end[1]]
 
     # Remove captured pieces
     for p, r, c in removed:
-        if p is not None and p is not mp:
+        if p is not None and p is not mp_piece:
             pc_idx = 0 if p.color == "white" else 1
             h ^= arr[pc_idx][p.z_idx][r][c]
 
@@ -318,8 +331,37 @@ class EngineWorker:
         run_bot_turn(self.bot)
 
 
+def _jit_warmup(bot_class):
+    """
+    Run one throwaway low-depth search the instant a persistent worker
+    boots, before any real task is pulled off the queue.
+
+    PyPy's JIT only compiles a loop after it's proven "hot" by running
+    many times; without this, the very first move of the game pays full
+    interpreter-speed cost while negamax/qsearch/order_moves get
+    compiled. Doing it here means that one-time cost lands during app
+    startup (while the UI window is still coming up) instead of during
+    the player's first real move.
+
+    Uses throwaway Queue/Event objects so nothing here touches the real
+    comm/cancel channels, and any failure is swallowed — a failed
+    warmup just means the first real move is a bit slower, not a
+    correctness problem.
+    """
+    try:
+        dummy_bot = bot_class(
+            Board(), 'white', {}, mp.Queue(), mp.Event(),
+            bot_name="__warmup__", ply_count=0, game_mode="bot",
+        )
+        dummy_bot.search_depth = 4
+        dummy_bot.make_move()
+    except Exception:
+        pass
+
+
 def persistent_worker(work_queue, comm_queue, cancel_event, bot_class):
     worker = EngineWorker(bot_class)
+    _jit_warmup(bot_class)
 
     while True:
         task = work_queue.get()
@@ -444,6 +486,12 @@ def write_series_stats_file(out_path, move_stats, series_stats, main_name, op_na
 # Every bot subclass (AI.py, OPAI.py, or future ones) uses these verbatim;
 # behavior-affecting logic (time budgets, pruning, eval weights) does NOT
 # belong here.
+#
+# TTEntry / TT_FLAG_* remain here as the shared flag-value contract between
+# bot subclasses. AI.py's ChessBot (v1.3+) no longer stores TTEntry objects
+# in a dict — it uses array-backed tables internally (see AI.py) — but the
+# flag *values* below are still what gets written into those arrays, so any
+# bot subclass must keep using them rather than inventing its own.
 # ---------------------------------------------------------------------------
 TTEntry = namedtuple('TTEntry', ['score', 'depth', 'flag', 'best_move', 'age'])
 TT_FLAG_EXACT, TT_FLAG_LOWERBOUND, TT_FLAG_UPPERBOUND = 0, 1, 2
@@ -457,6 +505,10 @@ def format_bot_move(bot, board_before, move):
 
 
 def get_pv_data(bot, max_depth, root_move):
+    """Walks the principal variation out of bot's transposition table.
+    Reads the array-backed TT via bot._tt_probe/bot.tt_moves (see AI.py
+    v1.3) rather than a dict — every ChessBot-family bot must expose
+    those two."""
     if not root_move: return [], []
 
     pv_san  = []
@@ -493,9 +545,10 @@ def get_pv_data(bot, max_depth, root_move):
         if h in seen_hashes: break
         seen_hashes.add(h)
 
-        tt_entry = bot.tt.get(h)
-        if not tt_entry or not tt_entry.best_move: break
-        move = tt_entry.best_move
+        tt_idx = bot._tt_probe(h)
+        if tt_idx == -1 or not bot.tt_moves[tt_idx]:
+            break
+        move = bot.tt_moves[tt_idx]
 
     return pv_san, pv_raw
 

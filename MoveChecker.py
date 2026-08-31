@@ -1,25 +1,17 @@
-# MoveChecker.py (v1.1 - parallel Perft via ProcessPoolExecutor across root moves)
+# MoveChecker.py (v2 - Use full fens)
 
 import os
 import time
 import threading
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 import tkinter as tk
 from tkinter import ttk, messagebox
-from GameLogic import get_all_legal_moves, format_move_san
+from GameLogic import get_all_legal_moves, format_move_san, Queen
+from EngineRuntime import board_to_fen
 
-# Below this requested depth, a Perft run is cheap enough (tens to a few
-# hundred nodes) that sequential execution beats paying process-pool
-# startup cost.
 PARALLEL_MIN_DEPTH = 3
 
-
 def _perft_rec(board, turn, depth):
-    """Plain recursive perft counter. Runs inside a worker process, one
-    call per root move's subtree — no cancellation checks here, since
-    cancelling a subtree that's already been dispatched to a worker
-    process means terminating that process (see _shutdown_executor_now),
-    not a cooperative check inside the recursion."""
     if depth == 0:
         return 1
     if depth == 1:
@@ -27,107 +19,91 @@ def _perft_rec(board, turn, depth):
     total = 0
     opp = 'black' if turn == 'white' else 'white'
     for m in get_all_legal_moves(board, turn):
-        rec = board.make_move_track(m[0], m[1])
+        promo = m[2] if len(m) > 2 and m[2] is not None else Queen
+        rec = board.make_move_track(m[0], m[1], promo)
         total += _perft_rec(board, opp, depth - 1)
         board.unmake_move(rec)
     return total
 
-
-def _perft_subtree_task(child_board, opp_turn, remaining_depth):
-    """The unit of work sent to each worker process: count leaves under
-    one already-applied root move. Module-level (not a closure) so
-    ProcessPoolExecutor can pickle and import it in the child process."""
+def _perft_task_wrapper(args):
+    child_board, opp_turn, remaining_depth = args
     return _perft_rec(child_board, opp_turn, remaining_depth)
 
-
-def _shutdown_executor_now(executor):
-    """shutdown(wait=False, cancel_futures=True) only cancels futures that
-    haven't started running yet — it can't stop a worker process that's
-    already mid-recursion. For a Cancel button that actually cancels, we
-    additionally terminate any still-alive worker processes directly.
-    This reaches into a private attribute (_processes); there's no public
-    API for "kill running work right now" on ProcessPoolExecutor, and an
-    orphaned worker process burning CPU after the user hit Cancel is worse
-    than depending on that attribute."""
-    try:
-        executor.shutdown(wait=False, cancel_futures=True)
-    except Exception:
-        pass
-    try:
-        for proc in list(executor._processes.values()):
-            if proc.is_alive():
-                proc.terminate()
-    except Exception:
-        pass
-
-
-def _sequential_root_results(child_boards, opp, depth):
-    """Depth < PARALLEL_MIN_DEPTH fallback: same computation, single process."""
-    for idx in range(len(child_boards)):
-        yield idx, _perft_subtree_task(child_boards[idx], opp, depth - 1)
-
-
-def _parallel_root_results(child_boards, opp, depth, max_workers, executor_holder, cancel_event):
-    """depth >= PARALLEL_MIN_DEPTH path: one task per root move, spread
-    across a process pool. Yields (idx, sub_nodes) as each completes —
-    NOT in root-move order, since faster subtrees finish first."""
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        executor_holder['executor'] = executor
-        future_to_idx = {
-            executor.submit(_perft_subtree_task, child_boards[idx], opp, depth - 1): idx
-            for idx in range(len(child_boards))
-        }
-        for future in as_completed(future_to_idx):
-            if cancel_event.is_set():
-                break
-            idx = future_to_idx[future]
-            try:
-                sub_nodes = future.result()
-            except Exception:
-                sub_nodes = 0
-            yield idx, sub_nodes
-    executor_holder.pop('executor', None)
-
-
-def launch_move_checker_dialog(master, board, turn, depth, colors, is_start_pos):
-    """Runs an asynchronous, non-blocking Perft test with a live progress dialog.
-    Root moves are dispatched to a process pool (depth >= PARALLEL_MIN_DEPTH)
-    so subtree counts run in parallel across CPU cores instead of one at a time."""
-
-    START_POS_PERFT = {
-        1:  20,
-        2:  400,
-        3:  8902,
-        4:  197281,
-        5:  4865609,
-        6:  119060324,
-        7:  3195901860,
-        8:  84997849941,
-        9:  2439530234167,
-        10: 69352859712417,
-        11: 2097651003696556,
-        12: 62854969295001380
+def launch_move_checker_dialog(master, board, turn, depth, colors, is_start_pos=False):
+    # Canonical Chess Programming Wiki (CPW) reference Perft positions
+    # Keyed by 4-field normalized FEN: <piece placement> <turn> <castling> <ep>
+    PERFT_POSITIONS = {
+        # Position 1 — Initial Standard Starting Position
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -": {
+            "name": "Start Position",
+            "counts": {
+                1: 20, 2: 400, 3: 8902, 4: 197281, 5: 4865609,
+                6: 119060324, 7: 3195901860, 8: 84997849941,
+            }
+        },
+        # Position 2 — Kiwipete (Peter Ellis) - Castling & Pin Stress Test
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -": {
+            "name": "Position 2 (Kiwipete)",
+            "counts": {
+                1: 48, 2: 2039, 3: 97862, 4: 4085603, 5: 193690690, 6: 8031647685,
+            }
+        },
+        # Position 3 — Endgame En Passant Discovered Check Torture Test
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -": {
+            "name": "Position 3 (EP Discovered Check)",
+            "counts": {
+                1: 14, 2: 191, 3: 2812, 4: 43238, 5: 674624, 6: 11030083, 7: 178633661,
+            }
+        },
+        # Position 4 — Complex Promotions, Pins & Skewers
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq -": {
+            "name": "Position 4 (Promotions & Pins)",
+            "counts": {
+                1: 6, 2: 264, 3: 9467, 4: 422333, 5: 15833292, 6: 706045033,
+            }
+        },
+        # Position 4 Mirrored — Black to Move
+        "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ -": {
+            "name": "Position 4 Mirrored (Black)",
+            "counts": {
+                1: 6, 2: 264, 3: 9467, 4: 422333, 5: 15833292, 6: 706045033,
+            }
+        },
+        # Position 5 — Discovered Checks & Underpromotions
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ -": {
+            "name": "Position 5 (Discovered Checks)",
+            "counts": {
+                1: 44, 2: 1486, 3: 62379, 4: 2103487, 5: 89941194,
+            }
+        },
+        # Position 6 — Edwards / Talkchess Middlegame
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - -": {
+            "name": "Position 6 (Middlegame)",
+            "counts": {
+                1: 46, 2: 2079, 3: 89890, 4: 3894594, 5: 164075551, 6: 6923051137,
+            }
+        },
     }
 
     dialog = tk.Toplevel(master)
     dialog.title(f"Perft Runner (Depth {depth})")
     dialog.configure(bg=colors['bg_dark'])
-    dialog.geometry("440x240")
+    dialog.geometry("460x250")
     dialog.resizable(False, False)
     dialog.transient(master)
     dialog.grab_set()
 
     dialog.update_idletasks()
-    mx = master.winfo_x() + (master.winfo_width() - 440) // 2
-    my = master.winfo_y() + (master.winfo_height() - 240) // 2
-    dialog.geometry(f"440x240+{mx}+{my}")
+    mx = master.winfo_x() + (master.winfo_width() - 460) // 2
+    my = master.winfo_y() + (master.winfo_height() - 250) // 2
+    dialog.geometry(f"460x250+{mx}+{my}")
 
     ttk.Label(dialog, text=f"Computing Perft Depth {depth}...", style='Header.TLabel').pack(pady=(12, 4))
     status_lbl = ttk.Label(dialog, text="Initializing search...", style='SmallHeader.TLabel')
     status_lbl.pack(pady=2)
 
     progress_var = tk.DoubleVar(value=0.0)
-    progress_bar = ttk.Progressbar(dialog, variable=progress_var, maximum=100.0, length=380)
+    progress_bar = ttk.Progressbar(dialog, variable=progress_var, maximum=100.0, length=400)
     progress_bar.pack(pady=8)
 
     stats_lbl = tk.Label(
@@ -137,13 +113,17 @@ def launch_move_checker_dialog(master, board, turn, depth, colors, is_start_pos)
     stats_lbl.pack(pady=4)
 
     cancel_event = threading.Event()
-    executor_holder = {}   # populated only while a process pool is live, so on_cancel can reach it
+    pool_holder = {}
 
     def on_cancel():
         cancel_event.set()
-        executor = executor_holder.get('executor')
-        if executor is not None:
-            _shutdown_executor_now(executor)
+        pool = pool_holder.get('pool')
+        if pool:
+            try:
+                pool.terminate()
+                pool.join()
+            except Exception:
+                pass
         dialog.destroy()
 
     cancel_btn = ttk.Button(dialog, text="Cancel", command=on_cancel, style='Control.TButton')
@@ -160,15 +140,12 @@ def launch_move_checker_dialog(master, board, turn, depth, colors, is_start_pos)
         opp = 'black' if turn == 'white' else 'white'
         t0 = time.time()
 
-        # One independent, already-move-applied board per root move, plus
-        # its SAN label computed up front. `board` itself is never mutated
-        # here (each root move gets its own clone), so it can be used
-        # directly as SAN's "board_before" reference for every move.
-        sans         = [None] * total_root_moves
+        sans = [None] * total_root_moves
         child_boards = [None] * total_root_moves
         for idx, m in enumerate(root_moves):
             child = board.clone()
-            child.make_move(m[0], m[1])
+            promo = m[2] if len(m) > 2 and m[2] is not None else Queen
+            child.make_move(m[0], m[1], promo)
             sans[idx] = format_move_san(board, child, m)
             child_boards[idx] = child
 
@@ -177,52 +154,92 @@ def launch_move_checker_dialog(master, board, turn, depth, colors, is_start_pos)
         completed = 0
 
         if depth < PARALLEL_MIN_DEPTH:
-            results_iter = _sequential_root_results(child_boards, opp, depth)
+            for idx in range(total_root_moves):
+                if cancel_event.is_set():
+                    return
+                sub_nodes = _perft_rec(child_boards[idx], opp, depth - 1)
+                divide_results[idx] = (sans[idx], root_moves[idx], sub_nodes)
+                total_nodes += sub_nodes
+                completed += 1
+                elapsed = max(0.001, time.time() - t0)
+                knps = (total_nodes / elapsed / 1000) if elapsed > 0 else 0
+                pct = (completed / total_root_moves) * 100.0
+                master.after(0, lambda p=pct, s=sans[idx], i=completed, tot=total_root_moves,
+                             n=total_nodes, el=elapsed, k=knps: [
+                    progress_var.set(p),
+                    status_lbl.config(text=f"Exploring branch {s} ({i}/{tot})..."),
+                    stats_lbl.config(text=f"Nodes: {n:,}  |  Time: {el:.1f}s  |  Speed: {k:.1f} KNPS")
+                ])
         else:
-            max_workers = os.cpu_count() or 4
-            results_iter = _parallel_root_results(
-                child_boards, opp, depth, max_workers, executor_holder, cancel_event)
+            num_workers = min(os.cpu_count() or 4, total_root_moves)
+            pool = mp.Pool(processes=num_workers)
+            pool_holder['pool'] = pool
 
-        for idx, sub_nodes in results_iter:
-            if cancel_event.is_set():
-                return
+            tasks = [(child_boards[i], opp, depth - 1) for i in range(total_root_moves)]
+            async_results = [pool.apply_async(_perft_task_wrapper, (t,)) for t in tasks]
 
-            divide_results[idx] = (sans[idx], root_moves[idx], sub_nodes)
-            total_nodes += sub_nodes
-            completed += 1
+            for idx, res in enumerate(async_results):
+                while not res.ready():
+                    if cancel_event.is_set():
+                        pool.terminate()
+                        pool.join()
+                        return
+                    time.sleep(0.02)
 
-            elapsed = max(0.001, time.time() - t0)
-            knps = (total_nodes / elapsed / 1000) if elapsed > 0 else 0
-            pct = (completed / total_root_moves) * 100.0
+                sub_nodes = res.get()
+                divide_results[idx] = (sans[idx], root_moves[idx], sub_nodes)
+                total_nodes += sub_nodes
+                completed += 1
 
-            master.after(0, lambda p=pct, s=sans[idx], i=completed, tot=total_root_moves,
-                         n=total_nodes, el=elapsed, k=knps: [
-                progress_var.set(p),
-                status_lbl.config(text=f"Exploring branch {s} ({i}/{tot})..."),
-                stats_lbl.config(text=f"Nodes: {n:,}  |  Time: {el:.1f}s  |  Speed: {k:.1f} KNPS")
-            ])
+                elapsed = max(0.001, time.time() - t0)
+                knps = (total_nodes / elapsed / 1000) if elapsed > 0 else 0
+                pct = (completed / total_root_moves) * 100.0
+
+                master.after(0, lambda p=pct, s=sans[idx], i=completed, tot=total_root_moves,
+                             n=total_nodes, el=elapsed, k=knps: [
+                    progress_var.set(p),
+                    status_lbl.config(text=f"Exploring branch {s} ({i}/{tot})..."),
+                    stats_lbl.config(text=f"Nodes: {n:,}  |  Time: {el:.1f}s  |  Speed: {k:.1f} KNPS")
+                ])
+
+            pool.close()
+            pool.join()
+            pool_holder.pop('pool', None)
 
         if cancel_event.is_set():
             return
 
         elapsed = max(0.001, time.time() - t0)
         knps = (total_nodes / elapsed / 1000) if elapsed > 0 else 0
-        expected = START_POS_PERFT.get(depth) if is_start_pos else None
+        
+        # Match normalized 4-part FEN (<piece placement> <turn> <castling> <ep>)
+        full_fen = board_to_fen(board, turn)
+        fen_parts = full_fen.split()
+        norm_fen = " ".join(fen_parts[:4])
+        
+        ref_entry = PERFT_POSITIONS.get(norm_fen)
+        if not ref_entry:
+            # Fallback to piece-placement-only key matching if shorthand was used
+            ref_entry = next((v for k, v in PERFT_POSITIONS.items() if k.split()[0] == fen_parts[0]), None)
+
+        pos_name = ref_entry["name"] if ref_entry else "Custom Position"
+        expected = ref_entry["counts"].get(depth) if ref_entry else None
         is_pass = (total_nodes == expected) if expected is not None else True
 
-        # Print divide results to terminal, in original root-move order
-        # (task completion order is nondeterministic under the pool).
         log_lines = [
-            f"\n--- PERFT (Depth {depth}, Turn: {turn.capitalize()}) ---",
+            f"\n--- PERFT: {pos_name} (Depth {depth}, Turn: {turn.capitalize()}) ---",
+            f"FEN: {full_fen}",
             f"Time: {elapsed:.3f}s | Speed: {knps:.1f} KNPS | Total Nodes: {total_nodes:,}"
         ]
         if expected is not None:
             status_str = "PASS [OK]" if is_pass else f"FAIL [Expected: {expected:,}]"
             log_lines.append(f"Standard Chess Reference Comparison: {status_str}")
+        else:
+            log_lines.append("No reference table for this position — count unverified.")
 
         log_lines.append("\nPerft Divide (Branch Leaf Counts):")
         for i, (san, m, cnt) in enumerate(divide_results, 1):
-            log_lines.append(f"  {i:2d}. {san.ljust(6)} ({m[0]} -> {m[1]}): {cnt:,}")
+            log_lines.append(f"  {i:2d}. {san.ljust(8)} ({m[0]} -> {m[1]}): {cnt:,}")
 
         print("\n".join(log_lines))
 
@@ -236,14 +253,14 @@ def launch_move_checker_dialog(master, board, turn, depth, colors, is_start_pos)
                 if is_pass:
                     messagebox.showinfo(
                         f"Perft Depth {depth} Passed",
-                        f"SUCCESS: Standard Chess Perft Depth {depth} verified!\n\n"
+                        f"SUCCESS: {pos_name} Depth {depth} verified!\n\n"
                         f"Total Nodes: {total_nodes:,} / {expected:,}\n"
                         f"Time: {elapsed:.3f}s ({knps:.1f} KNPS)"
                     )
                 else:
                     messagebox.showerror(
                         f"Perft Depth {depth} Failed",
-                        f"MISMATCH DETECTED at Depth {depth}!\n\n"
+                        f"MISMATCH DETECTED: {pos_name} at Depth {depth}!\n\n"
                         f"Actual Nodes: {total_nodes:,}\n"
                         f"Expected: {expected:,}\n\n"
                         f"See console divide log for details."
@@ -251,7 +268,7 @@ def launch_move_checker_dialog(master, board, turn, depth, colors, is_start_pos)
             else:
                 messagebox.showinfo(
                     f"Perft Depth {depth} Complete",
-                    f"Position Perft Complete (Depth {depth}):\n\n"
+                    f"Custom Position Perft Complete (Depth {depth}):\n\n"
                     f"Total Nodes: {total_nodes:,}\n"
                     f"Time: {elapsed:.3f}s ({knps:.1f} KNPS)"
                 )

@@ -1,10 +1,5 @@
-# GameLogic.py (v1.0 - Fixed SAN disambiguation)
+# GameLogic.py (v1.1 - Fixed legal movecount being off)
 
-
-# -----------------------------------------------------------------------
-# Global constants
-# z_idx reference: 0=Pawn 1=Knight 2=Bishop 3=Rook 4=Queen 5=King
-# -----------------------------------------------------------------------
 ROWS, COLS = 8, 8
 SQUARE_SIZE = 75
 BOARD_COLOR_1 = "#D2B48C"
@@ -72,7 +67,7 @@ def _clone_piece_fast(piece):
     new_piece.color          = piece.color
     new_piece.opponent_color = piece.opponent_color
     new_piece.pos            = piece.pos
-    new_piece._list_pos      = piece._list_pos   # preserve index in new board's list
+    new_piece._list_pos      = piece._list_pos
     if cls is Pawn:
         new_piece.direction    = piece.direction
         new_piece.starting_row = piece.starting_row
@@ -219,7 +214,17 @@ class Board:
         self.grid[end[0]][end[1]]     = piece
 
     def find_king_pos(self, color):
-        return self.white_king_pos if color == 'white' else self.black_king_pos
+        k = self.white_king_pos if color == 'white' else self.black_king_pos
+        if k is not None and self.grid[k[0]][k[1]] and self.grid[k[0]][k[1]].z_idx == 5:
+            return k
+        for r in range(ROWS):
+            for c in range(COLS):
+                p = self.grid[r][c]
+                if p and p.z_idx == 5 and p.color == color:
+                    if color == 'white': self.white_king_pos = (r, c)
+                    else:                self.black_king_pos = (r, c)
+                    return (r, c)
+        return None
 
     def clone(self):
         new_board                 = Board.__new__(Board)
@@ -294,9 +299,10 @@ class Board:
         # Promotion
         if mp_z == 0 and er == moving_piece.promo_rank:
             special = 3
+            p_to_add = promo_cls if promo_cls is not None else Queen
             removed.append((moving_piece, er, ec))
             self.remove_piece(er, ec)
-            promoted_piece = promo_cls(mc)
+            promoted_piece = p_to_add(mc)
             self.add_piece(promoted_piece, er, ec)
             added.append((promoted_piece, er, ec))
 
@@ -399,7 +405,7 @@ def is_square_attacked(board, r, c, attacking_color):
     return False
 
 def is_in_check(board, color):
-    kpos = board.white_king_pos if color == 'white' else board.black_king_pos
+    kpos = board.find_king_pos(color)
     if not kpos: return True
     return is_square_attacked(board, kpos[0], kpos[1], OPPONENT_COLOR[color])
 
@@ -416,73 +422,82 @@ def get_all_pseudo_legal_moves(board, color):
 
         if pz == 0: # Pawn
             dr = -1 if color == 'white' else 1
+            promo_r = p.promo_rank
             if 0 <= r + dr < 8 and grid[r + dr][c] is None:
-                moves.append(((r, c), (r + dr, c)))
-                if r == p.starting_row and grid[r + 2 * dr][c] is None:
-                    moves.append(((r, c), (r + 2 * dr, c)))
+                if r + dr == promo_r:
+                    for p_cls in (Queen, Rook, Bishop, Knight):
+                        moves.append(((r, c), (r + dr, c), p_cls))
+                else:
+                    moves.append(((r, c), (r + dr, c), None))
+                    if r == p.starting_row and grid[r + 2 * dr][c] is None:
+                        moves.append(((r, c), (r + 2 * dr, c), None))
             for dc in (-1, 1):
                 cr, cc = r + dr, c + dc
                 if 0 <= cr < 8 and 0 <= cc < 8:
                     target = grid[cr][cc]
                     if target and target.color == opp:
-                        moves.append(((r, c), (cr, cc)))
+                        if cr == promo_r:
+                            for p_cls in (Queen, Rook, Bishop, Knight):
+                                moves.append(((r, c), (cr, cc), p_cls))
+                        else:
+                            moves.append(((r, c), (cr, cc), None))
                     elif (cr, cc) == board.ep_square:
-                        moves.append(((r, c), (cr, cc)))
+                        moves.append(((r, c), (cr, cc), None))
 
         elif pz == 1: # Knight
             for kr, kc in KNIGHT_ATTACKS_FROM[(r, c)]:
                 target = grid[kr][kc]
                 if target is None or target.color == opp:
-                    moves.append(((r, c), (kr, kc)))
+                    moves.append(((r, c), (kr, kc), None))
 
         elif pz == 2: # Bishop
             for ray in RAYS_DIAGONAL[sq]:
                 for cr, cc in ray:
                     target = grid[cr][cc]
-                    if target is None: moves.append(((r, c), (cr, cc)))
+                    if target is None: moves.append(((r, c), (cr, cc), None))
                     else:
-                        if target.color == opp: moves.append(((r, c), (cr, cc)))
+                        if target.color == opp: moves.append(((r, c), (cr, cc), None))
                         break
 
         elif pz == 3: # Rook
             for ray in RAYS_ORTHOGONAL[sq]:
                 for cr, cc in ray:
                     target = grid[cr][cc]
-                    if target is None: moves.append(((r, c), (cr, cc)))
+                    if target is None: moves.append(((r, c), (cr, cc), None))
                     else:
-                        if target.color == opp: moves.append(((r, c), (cr, cc)))
+                        if target.color == opp: moves.append(((r, c), (cr, cc), None))
                         break
 
         elif pz == 4: # Queen
             for ray in RAYS_ALL[sq]:
                 for cr, cc in ray:
                     target = grid[cr][cc]
-                    if target is None: moves.append(((r, c), (cr, cc)))
+                    if target is None: moves.append(((r, c), (cr, cc), None))
                     else:
-                        if target.color == opp: moves.append(((r, c), (cr, cc)))
+                        if target.color == opp: moves.append(((r, c), (cr, cc), None))
                         break
 
         elif pz == 5: # King
             for kr, kc in KING_ATTACKS_FROM[(r, c)]:
                 target = grid[kr][kc]
                 if target is None or target.color == opp:
-                    moves.append(((r, c), (kr, kc)))
+                    moves.append(((r, c), (kr, kc), None))
 
             # Castling
             if color == 'white' and r == 7 and c == 4 and not is_in_check(board, 'white'):
                 if (board.castling_rights & CASTLE_WK) and grid[7][5] is None and grid[7][6] is None:
                     if not is_square_attacked(board, 7, 5, 'black') and not is_square_attacked(board, 7, 6, 'black'):
-                        moves.append(((7, 4), (7, 6)))
+                        moves.append(((7, 4), (7, 6), None))
                 if (board.castling_rights & CASTLE_WQ) and grid[7][3] is None and grid[7][2] is None and grid[7][1] is None:
                     if not is_square_attacked(board, 7, 3, 'black') and not is_square_attacked(board, 7, 2, 'black'):
-                        moves.append(((7, 4), (7, 2)))
+                        moves.append(((7, 4), (7, 2), None))
             elif color == 'black' and r == 0 and c == 4 and not is_in_check(board, 'black'):
                 if (board.castling_rights & CASTLE_BK) and grid[0][5] is None and grid[0][6] is None:
                     if not is_square_attacked(board, 0, 5, 'white') and not is_square_attacked(board, 0, 6, 'white'):
-                        moves.append(((0, 4), (0, 6)))
+                        moves.append(((0, 4), (0, 6), None))
                 if (board.castling_rights & CASTLE_BQ) and grid[0][3] is None and grid[0][2] is None and grid[0][1] is None:
                     if not is_square_attacked(board, 0, 3, 'white') and not is_square_attacked(board, 0, 2, 'white'):
-                        moves.append(((0, 4), (0, 2)))
+                        moves.append(((0, 4), (0, 2), None))
 
     return moves
 
@@ -499,6 +514,8 @@ def _is_square_attacked_ignoring_square(board, r, c, attacking_color, ignore_pos
 def _compute_check_and_pins(board, color):
     opp  = OPPONENT_COLOR[color]
     kpos = board.find_king_pos(color)
+    if not kpos:
+        return (0, 0), [], {}
     kr, kc = kpos
     grid = board.grid
     sq = kr * 8 + kc
@@ -551,6 +568,9 @@ def _compute_check_and_pins(board, color):
 
 def _generate_legal_moves(board, color):
     kpos, checkers, pinned = _compute_check_and_pins(board, color)
+    if not kpos or (kpos == (0, 0) and not checkers and not pinned and not board.find_king_pos(color)):
+        return
+
     grid = board.grid
     opp = OPPONENT_COLOR[color]
     kr, kc = kpos
@@ -561,7 +581,7 @@ def _generate_legal_moves(board, color):
             target = grid[tr][tc]
             if target is None or target.color == opp:
                 if not _is_square_attacked_ignoring_square(board, tr, tc, opp, kpos):
-                    yield ((kr, kc), (tr, tc))
+                    yield ((kr, kc), (tr, tc), None)
         return
 
     block_squares = None
@@ -582,13 +602,21 @@ def _generate_legal_moves(board, color):
         else:
             block_squares = {(ccr, ccc)}
 
-    for (sr, sc), (tr, tc) in get_all_pseudo_legal_moves(board, color):
+    for m in get_all_pseudo_legal_moves(board, color):
+        (sr, sc), (tr, tc) = m[0], m[1]
+        promo = m[2] if len(m) > 2 else None
         piece = grid[sr][sc]
+        if not piece:
+            continue
 
-        if piece.z_idx == 5:
+        if piece.z_idx == 5:  # King
+            if abs(tc - sc) == 2:
+                yield ((sr, sc), (tr, tc), None)
+                continue
+
             if _is_square_attacked_ignoring_square(board, tr, tc, opp, kpos):
                 continue
-            yield ((sr, sc), (tr, tc))
+            yield ((sr, sc), (tr, tc), None)
             continue
 
         if num_checkers == 1 and (tr, tc) not in block_squares:
@@ -608,7 +636,7 @@ def _generate_legal_moves(board, color):
             if still_in_check:
                 continue
 
-        yield ((sr, sc), (tr, tc))
+        yield ((sr, sc), (tr, tc), promo)
 
 def get_all_legal_moves(board, color):
     return list(_generate_legal_moves(board, color))
@@ -694,12 +722,12 @@ def fast_approximate_material_swing(board, move, moving_piece, target_piece, pie
 
 def format_move(move):
     if not move: return "None"
-    (r1, c1), (r2, c2) = move
+    (r1, c1), (r2, c2) = move[:2]
     return f"{'abcdefgh'[c1]}{'87654321'[r1]}-{'abcdefgh'[c2]}{'87654321'[r2]}"
 
 def format_move_san(board_before, board_after, move):
     if not move: return "None"
-    start_pos, end_pos = move
+    start_pos, end_pos = move[0], move[1]
     p = board_before.grid[start_pos[0]][start_pos[1]]
     if not p: return format_move(move)
 

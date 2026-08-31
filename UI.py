@@ -1,4 +1,4 @@
-# ChessUI.py (v1.4 - Bug fixes for: Timeouts, FEN Validation, Promotions)
+# ChessUI.py (v2 - Castling fen parsing correct)
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -672,11 +672,16 @@ class EnhancedChessApp:
         self.turn = "white" if (parts[1] if len(parts) > 1 else 'w').lower() == 'w' else "black"
 
         self.board.castling_rights = 0
-        if len(parts) > 2 and parts[2] != '-':
-            if 'K' in parts[2]: self.board.castling_rights |= CASTLE_WK
-            if 'Q' in parts[2]: self.board.castling_rights |= CASTLE_WQ
-            if 'k' in parts[2]: self.board.castling_rights |= CASTLE_BK
-            if 'q' in parts[2]: self.board.castling_rights |= CASTLE_BQ
+        if len(parts) > 2:
+            if parts[2] != '-':
+                if 'K' in parts[2]: self.board.castling_rights |= CASTLE_WK
+                if 'Q' in parts[2]: self.board.castling_rights |= CASTLE_WQ
+                if 'k' in parts[2]: self.board.castling_rights |= CASTLE_BK
+                if 'q' in parts[2]: self.board.castling_rights |= CASTLE_BQ
+        else:
+            # Only the standard start position defaults to KQkq if flags were omitted
+            if parts[0] == "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR":
+                self.board.castling_rights = 15
 
         # Parse En Passant
         self.board.ep_square = None
@@ -1108,8 +1113,10 @@ class EnhancedChessApp:
 
     def run_move_checker(self):
         depth = int(self.bot_depth_slider.get())
-        is_start_pos = (self.history_pointer <= 0 and self.turn == "white" and
-                        self.board.castling_rights == 15 and self.board.ep_square is None)
+        # Compare the actual board arrangement, not just castling/turn flags.
+        # The old check falsely matched Kiwipete (KQkq, white to move, no ep).
+        is_start_pos = (self.get_current_fen().split()[0] ==
+                        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR")
         
         launch_move_checker_dialog(
             self.master, 

@@ -1,4 +1,4 @@
-# AI.py (v1.7 - SEE + Move ordering changes)
+# AI.py (v1.8 - Evaluation update)
 
 import time
 import random
@@ -100,9 +100,12 @@ class ChessBot:
     TEMPO_BONUS = 20
     EVAL_CASTLING_RIGHTS = 15
     EVAL_DEV_BONUS = 10
-    EVAL_BISHOP_PAIR = 30
+    EVAL_BISHOP_PAIR = 25
+    EVAL_ROOK_ON_7TH = 25
     EVAL_ROOK_OPEN_FILE = 20
     EVAL_ROOK_SEMI_OPEN = 10
+    EVAL_PAWN_DEFENDED = 10
+    EVAL_PAWN_SHIELD = 10
     EVAL_PASSED_PAWN_RANK = [0, 5, 10, 20, 35, 60, 100, 0]
 
     def __init__(self, board, color, position_counts, comm_queue, cancellation_event,
@@ -910,6 +913,7 @@ class ChessBot:
         )
 
         piece_lists = [board.white_pieces, board.black_pieces]
+        grid = board.grid
 
         w_pawn_files = [0] * 8
         b_pawn_files = [0] * 8
@@ -925,6 +929,11 @@ class ChessBot:
             opp_pawn_files = b_pawn_files if is_white else w_pawn_files
             pst_mg   = FLAT_PST_MG_WHITE if is_white else FLAT_PST_MG_BLACK
             pst_eg   = FLAT_PST_EG_WHITE if is_white else FLAT_PST_EG_BLACK
+            home_rank = 7 if is_white else 0
+            seventh_rank = 1 if is_white else 6
+            opp_color = 'black' if is_white else 'white'
+            mob_mg = 0
+            mob_eg = 0
 
             for piece in pieces:
                 z    = piece.z_idx
@@ -934,19 +943,11 @@ class ChessBot:
                 scores_mg[color_idx] += pst_mg[z][sq]
                 scores_eg[color_idx] += pst_eg[z][sq]
 
-                # Rook on open / semi-open files
-                if z == 3:
-                    if my_pawn_files[c] == 0:
-                        if opp_pawn_files[c] == 0:
-                            scores_mg[color_idx] += self.EVAL_ROOK_OPEN_FILE
-                            scores_eg[color_idx] += self.EVAL_ROOK_OPEN_FILE
-                        else:
-                            scores_mg[color_idx] += self.EVAL_ROOK_SEMI_OPEN
-                            scores_eg[color_idx] += self.EVAL_ROOK_SEMI_OPEN
-
-                # Passed pawn bonus
-                elif z == 0:
+                # 1. Pawns (Passed & Defended)
+                if z == 0:
                     advancement = (7 - r) if is_white else r
+
+                    # Passed pawn
                     is_passed = True
                     for fc in range(max(0, c - 1), min(8, c + 2)):
                         opp_pieces = board.black_pieces if is_white else board.white_pieces
@@ -959,27 +960,102 @@ class ChessBot:
                     if is_passed and advancement < len(self.EVAL_PASSED_PAWN_RANK):
                         scores_eg[color_idx] += self.EVAL_PASSED_PAWN_RANK[advancement]
 
-            # Bishop pair bonus
+                    # Defended by another friendly pawn behind it
+                    p_def_r = r + 1 if is_white else r - 1
+                    if 0 <= p_def_r < 8:
+                        if (c > 0 and grid[p_def_r][c - 1] and grid[p_def_r][c - 1].z_idx == 0 and grid[p_def_r][c - 1].color == piece.color) or \
+                           (c < 7 and grid[p_def_r][c + 1] and grid[p_def_r][c + 1].z_idx == 0 and grid[p_def_r][c + 1].color == piece.color):
+                            scores_mg[color_idx] += self.EVAL_PAWN_DEFENDED
+
+                # 2. Knights (Development & Mobility)
+                elif z == 1:
+                    if r != home_rank:
+                        scores_mg[color_idx] += self.EVAL_DEV_BONUS
+                    safe_sqs = 0
+                    for kr, kc in KNIGHT_ATTACKS_FROM[(r, c)]:
+                        target = grid[kr][kc]
+                        if target is None or target.color == opp_color: safe_sqs += 1
+                    mob_mg += safe_sqs * 4
+                    mob_eg += safe_sqs * 4
+
+                # 3. Bishops (Development & Mobility)
+                elif z == 2:
+                    if r != home_rank:
+                        scores_mg[color_idx] += self.EVAL_DEV_BONUS
+                    safe_sqs = 0
+                    for ray in RAYS_DIAGONAL[sq]:
+                        for cr, cc in ray:
+                            target = grid[cr][cc]
+                            if target is None: safe_sqs += 1
+                            else:
+                                if target.color == opp_color: safe_sqs += 1
+                                break
+                    mob_mg += safe_sqs * 4
+                    mob_eg += safe_sqs * 4
+
+                # 4. Rooks (7th Rank, Open Files & Mobility)
+                elif z == 3:
+                    if r == seventh_rank:
+                        scores_mg[color_idx] += self.EVAL_ROOK_ON_7TH
+                        scores_eg[color_idx] += self.EVAL_ROOK_ON_7TH
+
+                    if my_pawn_files[c] == 0:
+                        if opp_pawn_files[c] == 0:
+                            scores_mg[color_idx] += self.EVAL_ROOK_OPEN_FILE
+                            scores_eg[color_idx] += self.EVAL_ROOK_OPEN_FILE
+                        else:
+                            scores_mg[color_idx] += self.EVAL_ROOK_SEMI_OPEN
+                            scores_eg[color_idx] += self.EVAL_ROOK_SEMI_OPEN
+
+                    safe_sqs = 0
+                    for ray in RAYS_ORTHOGONAL[sq]:
+                        for cr, cc in ray:
+                            target = grid[cr][cc]
+                            if target is None: safe_sqs += 1
+                            else:
+                                if target.color == opp_color: safe_sqs += 1
+                                break
+                    mob_mg += safe_sqs * 2
+                    mob_eg += safe_sqs * 4
+
+                # 5. Queens (Mobility)
+                elif z == 4:
+                    safe_sqs = 0
+                    for ray in RAYS_ALL[sq]:
+                        for cr, cc in ray:
+                            target = grid[cr][cc]
+                            if target is None: safe_sqs += 1
+                            else:
+                                if target.color == opp_color: safe_sqs += 1
+                                break
+                    mob_mg += safe_sqs * 1
+                    mob_eg += safe_sqs * 2
+
+                # 6. King (Pawn Shield for Castled King)
+                elif z == 5:
+                    if (is_white and r == 7 and (c == 6 or c == 2)) or (not is_white and r == 0 and (c == 6 or c == 2)):
+                        shield_r = 6 if is_white else 1
+                        shield_intact = 0
+                        for sc in range(max(0, c - 1), min(8, c + 2)):
+                            sp = grid[shield_r][sc]
+                            if sp and sp.z_idx == 0 and sp.color == piece.color:
+                                shield_intact += 1
+                        scores_mg[color_idx] += shield_intact * self.EVAL_PAWN_SHIELD
+
+            # Global color bonuses
+            scores_mg[color_idx] += mob_mg // 2
+            scores_eg[color_idx] += mob_eg // 2
+
             if board.piece_counts_z['white' if is_white else 'black'][2] >= 2:
                 scores_mg[color_idx] += self.EVAL_BISHOP_PAIR
                 scores_eg[color_idx] += self.EVAL_BISHOP_PAIR
 
-            # Castling rights retention bonus
             c_rights = board.castling_rights
-            if is_white:
-                if c_rights & (CASTLE_WK | CASTLE_WQ):
-                    scores_mg[color_idx] += self.EVAL_CASTLING_RIGHTS
-            else:
-                if c_rights & (CASTLE_BK | CASTLE_BQ):
-                    scores_mg[color_idx] += self.EVAL_CASTLING_RIGHTS
+            if is_white and (c_rights & (CASTLE_WK | CASTLE_WQ)):
+                scores_mg[color_idx] += self.EVAL_CASTLING_RIGHTS
+            elif not is_white and (c_rights & (CASTLE_BK | CASTLE_BQ)):
+                scores_mg[color_idx] += self.EVAL_CASTLING_RIGHTS
 
-            # Minor piece development bonus (rewards developing off the back rank)
-            home_rank = 7 if is_white else 0
-            for piece in pieces:
-                if (piece.z_idx == 1 or piece.z_idx == 2) and piece.pos[0] != home_rank:
-                    scores_mg[color_idx] += self.EVAL_DEV_BONUS
-
-            # Doubled pawn penalty (-15 per doubled pawn)
             for count in my_pawn_files:
                 if count > 1:
                     penalty = (count - 1) * 15

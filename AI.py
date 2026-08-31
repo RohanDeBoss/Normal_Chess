@@ -1,4 +1,4 @@
-# AI.py (v1.6 - PyPy port: Array TT, 3-Tuple Promo Handling, Tempo Bonus, Aspiration Bounds Fix)
+# AI.py (v1.7 - SEE + Move ordering changes)
 
 import time
 import random
@@ -98,6 +98,8 @@ class ChessBot:
     MAX_EXTENSION_DEPTH = 16
 
     TEMPO_BONUS = 20
+    EVAL_CASTLING_RIGHTS = 15
+    EVAL_DEV_BONUS = 10
     EVAL_BISHOP_PAIR = 30
     EVAL_ROOK_OPEN_FILE = 20
     EVAL_ROOK_SEMI_OPEN = 10
@@ -649,7 +651,7 @@ class ChessBot:
                     if (ply < len(self.killer_moves) and move[:2] in [k[:2] for k in self.killer_moves[ply] if k]) or (c_move and move[:2] == c_move[:2]):
                         reduction -= 1
                         
-                    if history_table[f_sq][t_sq] > 250_000:
+                    if history_table[f_sq][t_sq] > 500:
                         reduction -= 1
                         
                     reduction = max(0, min(reduction, depth - 2))
@@ -812,8 +814,12 @@ class ChessBot:
             moving_piece = grid[r1][c1]
             target_piece = grid[r2][c2]
 
+            # Only search tactical captures with SEE >= 0
+            if target_piece is None and not (moving_piece.z_idx == 0 and (move[1] == board.ep_square or move[1][0] == moving_piece.promo_rank)):
+                continue
+
             swing, is_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
-            if not is_tactic: continue
+            if not is_tactic: continue  # Prunes losing exchanges (SEE < 0)
             if stand_pat + swing + 200 < alpha: continue
 
             score = swing * 10 - moving_piece.z_idx
@@ -856,8 +862,13 @@ class ChessBot:
 
             if hash_move and move[:2] == hash_move[:2]:
                 score = self.BONUS_PV_MOVE
-            elif is_good_tactic:
-                score = self.BONUS_CAPTURE + (swing * 100) - moving_piece.z_idx
+            elif target_piece is not None or is_good_tactic:
+                if swing > 0:
+                    score = self.BONUS_CAPTURE + (swing * 100) - moving_piece.z_idx
+                elif swing == 0:
+                    score = 6_000_000 - moving_piece.z_idx
+                else:
+                    score = -1_000_000 + swing  # Bad capture: rank below quiet moves
             elif k1 and move[:2] == k1[:2]:
                 score = self.BONUS_KILLER_1
             elif k2 and move[:2] == k2[:2]:
@@ -953,6 +964,21 @@ class ChessBot:
                 scores_mg[color_idx] += self.EVAL_BISHOP_PAIR
                 scores_eg[color_idx] += self.EVAL_BISHOP_PAIR
 
+            # Castling rights retention bonus
+            c_rights = board.castling_rights
+            if is_white:
+                if c_rights & (CASTLE_WK | CASTLE_WQ):
+                    scores_mg[color_idx] += self.EVAL_CASTLING_RIGHTS
+            else:
+                if c_rights & (CASTLE_BK | CASTLE_BQ):
+                    scores_mg[color_idx] += self.EVAL_CASTLING_RIGHTS
+
+            # Minor piece development bonus (rewards developing off the back rank)
+            home_rank = 7 if is_white else 0
+            for piece in pieces:
+                if (piece.z_idx == 1 or piece.z_idx == 2) and piece.pos[0] != home_rank:
+                    scores_mg[color_idx] += self.EVAL_DEV_BONUS
+
             # Doubled pawn penalty (-15 per doubled pawn)
             for count in my_pawn_files:
                 if count > 1:
@@ -976,10 +1002,10 @@ pawn_pst = [
     [  0,   0,   0,   0,   0,   0,   0,   0],
     [ 50,  50,  50,  50,  50,  50,  50,  50],
     [ 10,  10,  20,  30,  30,  20,  10,  10],
-    [  5,   5,  10,  25,  25,  10,   5,   5],
-    [  0,   0,   0,  20,  20,   0,   0,   0],
+    [  5,   5,  15,  35,  35,  15,   5,   5],
+    [  0,   0,  10,  30,  30,  10,   0,   0],
     [  5,  -5, -10,   0,   0, -10,  -5,   5],
-    [  5,  10,  10, -20, -20,  10,  10,   5],
+    [  5,  10,  10, -25, -25,  10,  10,   5],
     [  0,   0,   0,   0,   0,   0,   0,   0]
 ]
 
@@ -1045,8 +1071,8 @@ king_midgame_pst = [
     [-30, -40, -40, -50, -50, -40, -40, -30],
     [-20, -30, -30, -40, -40, -30, -20, -20],
     [-10, -20, -20, -20, -20, -20, -20, -10],
-    [ 20,  20,   0,   0,   0,   0,  20,  20],
-    [ 20,  30,  10,   0,   0,  10,  30,  20]
+    [ 20,  20,   5,   5,   5,   5,  20,  20],
+    [ 20,  25,  15,  15,  15,  15,  25,  20]
 ]
 
 king_endgame_pst = [

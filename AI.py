@@ -1,4 +1,4 @@
-# AI.py (v1.8 - Evaluation update)
+# AI.py (v2.0 - Lean Eval, SEE Move Ordering, Capture-Only QSearch and bottleneck removed)
 
 import time
 import random
@@ -646,15 +646,24 @@ class ChessBot:
                         continue
 
                 reduction = 0
+                is_castling = (moving_piece.z_idx == 5 and abs(move[1][1] - move[0][1]) == 2)
                 if (depth >= self.LMR_DEPTH_THRESHOLD and
                         legal_moves_count > self.LMR_MOVE_COUNT_THRESHOLD and
-                        not is_in_check_flag and not is_good_tactic):
+                        not is_in_check_flag and not is_good_tactic and not is_castling):
                     reduction = 1 + (depth // 6) + (legal_moves_count // 12)
 
-                    if (ply < len(self.killer_moves) and move[:2] in [k[:2] for k in self.killer_moves[ply] if k]) or (c_move and move[:2] == c_move[:2]):
+                    # Avoid list allocations in the hot loop
+                    is_killer = False
+                    if ply < len(self.killer_moves):
+                        k0, k1 = self.killer_moves[ply]
+                        is_killer = (k0 is not None and move[:2] == k0[:2]) or \
+                                    (k1 is not None and move[:2] == k1[:2])
+
+                    if is_killer or (c_move and move[:2] == c_move[:2]):
                         reduction -= 1
                         
-                    if history_table[f_sq][t_sq] > 500:
+                    # 10_000 correctly matches the 2,000,000 gravity table scale
+                    if history_table[f_sq][t_sq] > 10_000:
                         reduction -= 1
                         
                     reduction = max(0, min(reduction, depth - 2))
@@ -803,13 +812,13 @@ class ChessBot:
                 return -self.MATE_SCORE + ply
             return best_score
 
-        # Not in check
+        # Not in check: Generate ONLY captures and tactical promotions (2x speedup!)
         stand_pat = self._get_cached_static_eval(board, turn, hash_val)
         best_score = stand_pat
         if stand_pat >= beta: return stand_pat
         if stand_pat > alpha: alpha = stand_pat
 
-        promising_moves = get_all_legal_moves(board, turn)
+        promising_moves = get_all_legal_captures(board, turn)
         scored_moves = []
 
         for move in promising_moves:
@@ -817,12 +826,8 @@ class ChessBot:
             moving_piece = grid[r1][c1]
             target_piece = grid[r2][c2]
 
-            # Only search tactical captures with SEE >= 0
-            if target_piece is None and not (moving_piece.z_idx == 0 and (move[1] == board.ep_square or move[1][0] == moving_piece.promo_rank)):
-                continue
-
             swing, is_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
-            if not is_tactic: continue  # Prunes losing exchanges (SEE < 0)
+            if not is_tactic: continue
             if stand_pat + swing + 200 < alpha: continue
 
             score = swing * 10 - moving_piece.z_idx
@@ -931,9 +936,6 @@ class ChessBot:
             pst_eg   = FLAT_PST_EG_WHITE if is_white else FLAT_PST_EG_BLACK
             home_rank = 7 if is_white else 0
             seventh_rank = 1 if is_white else 6
-            opp_color = 'black' if is_white else 'white'
-            mob_mg = 0
-            mob_eg = 0
 
             for piece in pieces:
                 z    = piece.z_idx
@@ -960,40 +962,19 @@ class ChessBot:
                     if is_passed and advancement < len(self.EVAL_PASSED_PAWN_RANK):
                         scores_eg[color_idx] += self.EVAL_PASSED_PAWN_RANK[advancement]
 
-                    # Defended by another friendly pawn behind it
+                    # Defended by friendly pawn
                     p_def_r = r + 1 if is_white else r - 1
                     if 0 <= p_def_r < 8:
                         if (c > 0 and grid[p_def_r][c - 1] and grid[p_def_r][c - 1].z_idx == 0 and grid[p_def_r][c - 1].color == piece.color) or \
                            (c < 7 and grid[p_def_r][c + 1] and grid[p_def_r][c + 1].z_idx == 0 and grid[p_def_r][c + 1].color == piece.color):
                             scores_mg[color_idx] += self.EVAL_PAWN_DEFENDED
 
-                # 2. Knights (Development & Mobility)
-                elif z == 1:
+                # 2. Minor Piece Development
+                elif z == 1 or z == 2:
                     if r != home_rank:
                         scores_mg[color_idx] += self.EVAL_DEV_BONUS
-                    safe_sqs = 0
-                    for kr, kc in KNIGHT_ATTACKS_FROM[(r, c)]:
-                        target = grid[kr][kc]
-                        if target is None or target.color == opp_color: safe_sqs += 1
-                    mob_mg += safe_sqs * 4
-                    mob_eg += safe_sqs * 4
 
-                # 3. Bishops (Development & Mobility)
-                elif z == 2:
-                    if r != home_rank:
-                        scores_mg[color_idx] += self.EVAL_DEV_BONUS
-                    safe_sqs = 0
-                    for ray in RAYS_DIAGONAL[sq]:
-                        for cr, cc in ray:
-                            target = grid[cr][cc]
-                            if target is None: safe_sqs += 1
-                            else:
-                                if target.color == opp_color: safe_sqs += 1
-                                break
-                    mob_mg += safe_sqs * 4
-                    mob_eg += safe_sqs * 4
-
-                # 4. Rooks (7th Rank, Open Files & Mobility)
+                # 3. Rooks (7th rank & Open files)
                 elif z == 3:
                     if r == seventh_rank:
                         scores_mg[color_idx] += self.EVAL_ROOK_ON_7TH
@@ -1007,31 +988,7 @@ class ChessBot:
                             scores_mg[color_idx] += self.EVAL_ROOK_SEMI_OPEN
                             scores_eg[color_idx] += self.EVAL_ROOK_SEMI_OPEN
 
-                    safe_sqs = 0
-                    for ray in RAYS_ORTHOGONAL[sq]:
-                        for cr, cc in ray:
-                            target = grid[cr][cc]
-                            if target is None: safe_sqs += 1
-                            else:
-                                if target.color == opp_color: safe_sqs += 1
-                                break
-                    mob_mg += safe_sqs * 2
-                    mob_eg += safe_sqs * 4
-
-                # 5. Queens (Mobility)
-                elif z == 4:
-                    safe_sqs = 0
-                    for ray in RAYS_ALL[sq]:
-                        for cr, cc in ray:
-                            target = grid[cr][cc]
-                            if target is None: safe_sqs += 1
-                            else:
-                                if target.color == opp_color: safe_sqs += 1
-                                break
-                    mob_mg += safe_sqs * 1
-                    mob_eg += safe_sqs * 2
-
-                # 6. King (Pawn Shield for Castled King)
+                # 4. Castled King Pawn Shield
                 elif z == 5:
                     if (is_white and r == 7 and (c == 6 or c == 2)) or (not is_white and r == 0 and (c == 6 or c == 2)):
                         shield_r = 6 if is_white else 1
@@ -1042,20 +999,19 @@ class ChessBot:
                                 shield_intact += 1
                         scores_mg[color_idx] += shield_intact * self.EVAL_PAWN_SHIELD
 
-            # Global color bonuses
-            scores_mg[color_idx] += mob_mg // 2
-            scores_eg[color_idx] += mob_eg // 2
-
+            # Bishop pair
             if board.piece_counts_z['white' if is_white else 'black'][2] >= 2:
                 scores_mg[color_idx] += self.EVAL_BISHOP_PAIR
                 scores_eg[color_idx] += self.EVAL_BISHOP_PAIR
 
+            # Castling rights retention
             c_rights = board.castling_rights
             if is_white and (c_rights & (CASTLE_WK | CASTLE_WQ)):
                 scores_mg[color_idx] += self.EVAL_CASTLING_RIGHTS
             elif not is_white and (c_rights & (CASTLE_BK | CASTLE_BQ)):
                 scores_mg[color_idx] += self.EVAL_CASTLING_RIGHTS
 
+            # Doubled pawns
             for count in my_pawn_files:
                 if count > 1:
                     penalty = (count - 1) * 15

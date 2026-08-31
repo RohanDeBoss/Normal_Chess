@@ -6,7 +6,6 @@ import math
 import random
 import time
 import re
-import threading
 from GameLogic import *
 from AI import ChessBot, board_hash
 from OpponentAI import OpponentAI

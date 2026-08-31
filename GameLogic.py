@@ -1,4 +1,4 @@
-# GameLogic.py (v1.2 - SEE)
+# GameLogic.py (v1.3 - High Performance Standard Chess Rules & Capture-Only Movegen)
 
 ROWS, COLS = 8, 8
 SQUARE_SIZE = 75
@@ -214,12 +214,17 @@ class Board:
         self.grid[end[0]][end[1]]     = piece
 
     def find_king_pos(self, color):
-        # Fuzz-tested against python-chess across 160 random games (castling,
-        # promotions, en passant) plus depth-4/5 Perft on 6 reference positions
-        # with zero desyncs — the O(64) fallback scan this used to have never
-        # fired, so it was pure overhead on every is_in_check call. Back to a
-        # plain attribute read.
-        return self.white_king_pos if color == 'white' else self.black_king_pos
+        k = self.white_king_pos if color == 'white' else self.black_king_pos
+        if k is not None and self.grid[k[0]][k[1]] and self.grid[k[0]][k[1]].z_idx == 5:
+            return k
+        for r in range(ROWS):
+            for c in range(COLS):
+                p = self.grid[r][c]
+                if p and p.z_idx == 5 and p.color == color:
+                    if color == 'white': self.white_king_pos = (r, c)
+                    else:                self.black_king_pos = (r, c)
+                    return (r, c)
+        return None
 
     def clone(self):
         new_board                 = Board.__new__(Board)
@@ -496,6 +501,80 @@ def get_all_pseudo_legal_moves(board, color):
 
     return moves
 
+def get_pseudo_legal_captures(board, color):
+    """High-speed capture-only generator for Quiescence Search."""
+    moves = []
+    grid = board.grid
+    opp = OPPONENT_COLOR[color]
+    pieces = board.white_pieces if color == 'white' else board.black_pieces
+
+    for p in pieces:
+        r, c = p.pos
+        sq = r * 8 + c
+        pz = p.z_idx
+
+        if pz == 0: # Pawn
+            dr = -1 if color == 'white' else 1
+            promo_r = p.promo_rank
+            # Forward promotion (tactical)
+            if 0 <= r + dr < 8 and grid[r + dr][c] is None and r + dr == promo_r:
+                for p_cls in (Queen, Rook, Bishop, Knight):
+                    moves.append(((r, c), (r + dr, c), p_cls))
+            # Diagonal captures
+            for dc in (-1, 1):
+                cr, cc = r + dr, c + dc
+                if 0 <= cr < 8 and 0 <= cc < 8:
+                    target = grid[cr][cc]
+                    if target and target.color == opp:
+                        if cr == promo_r:
+                            for p_cls in (Queen, Rook, Bishop, Knight):
+                                moves.append(((r, c), (cr, cc), p_cls))
+                        else:
+                            moves.append(((r, c), (cr, cc), None))
+                    elif (cr, cc) == board.ep_square:
+                        moves.append(((r, c), (cr, cc), None))
+
+        elif pz == 1: # Knight
+            for kr, kc in KNIGHT_ATTACKS_FROM[(r, c)]:
+                target = grid[kr][kc]
+                if target and target.color == opp:
+                    moves.append(((r, c), (kr, kc), None))
+
+        elif pz == 2: # Bishop
+            for ray in RAYS_DIAGONAL[sq]:
+                for cr, cc in ray:
+                    target = grid[cr][cc]
+                    if target is not None:
+                        if target.color == opp:
+                            moves.append(((r, c), (cr, cc), None))
+                        break
+
+        elif pz == 3: # Rook
+            for ray in RAYS_ORTHOGONAL[sq]:
+                for cr, cc in ray:
+                    target = grid[cr][cc]
+                    if target is not None:
+                        if target.color == opp:
+                            moves.append(((r, c), (cr, cc), None))
+                        break
+
+        elif pz == 4: # Queen
+            for ray in RAYS_ALL[sq]:
+                for cr, cc in ray:
+                    target = grid[cr][cc]
+                    if target is not None:
+                        if target.color == opp:
+                            moves.append(((r, c), (cr, cc), None))
+                        break
+
+        elif pz == 5: # King
+            for kr, kc in KING_ATTACKS_FROM[(r, c)]:
+                target = grid[kr][kc]
+                if target and target.color == opp:
+                    moves.append(((r, c), (kr, kc), None))
+
+    return moves
+
 def _is_square_attacked_ignoring_square(board, r, c, attacking_color, ignore_pos):
     grid = board.grid
     ir, ic = ignore_pos
@@ -509,6 +588,8 @@ def _is_square_attacked_ignoring_square(board, r, c, attacking_color, ignore_pos
 def _compute_check_and_pins(board, color):
     opp  = OPPONENT_COLOR[color]
     kpos = board.find_king_pos(color)
+    if not kpos:
+        return (0, 0), [], {}
     kr, kc = kpos
     grid = board.grid
     sq = kr * 8 + kc
@@ -554,13 +635,17 @@ def _compute_check_and_pins(board, color):
                         pinned[(blocker[1], blocker[2])] = frozenset(seen)
                     break
 
+    # Execute ray scans at the function level (4 spaces indent)
     _scan_rays(RAYS_ORTHOGONAL[sq], (3, 4))  # Rook, Queen
     _scan_rays(RAYS_DIAGONAL[sq],   (2, 4))  # Bishop, Queen
 
     return kpos, checkers, pinned
 
-def _generate_legal_moves(board, color):
+def _generate_legal_moves(board, color, captures_only=False):
     kpos, checkers, pinned = _compute_check_and_pins(board, color)
+    if not kpos or (kpos == (0, 0) and not checkers and not pinned and not board.find_king_pos(color)):
+        return
+
     grid = board.grid
     opp = OPPONENT_COLOR[color]
     kr, kc = kpos
@@ -570,6 +655,8 @@ def _generate_legal_moves(board, color):
         for tr, tc in KING_ATTACKS_FROM[(kr, kc)]:
             target = grid[tr][tc]
             if target is None or target.color == opp:
+                if captures_only and (target is None or target.color != opp):
+                    continue
                 if not _is_square_attacked_ignoring_square(board, tr, tc, opp, kpos):
                     yield ((kr, kc), (tr, tc), None)
         return
@@ -592,7 +679,9 @@ def _generate_legal_moves(board, color):
         else:
             block_squares = {(ccr, ccc)}
 
-    for m in get_all_pseudo_legal_moves(board, color):
+    move_source = get_pseudo_legal_captures(board, color) if captures_only else get_all_pseudo_legal_moves(board, color)
+
+    for m in move_source:
         (sr, sc), (tr, tc) = m[0], m[1]
         promo = m[2] if len(m) > 2 else None
         piece = grid[sr][sc]
@@ -601,7 +690,8 @@ def _generate_legal_moves(board, color):
 
         if piece.z_idx == 5:  # King
             if abs(tc - sc) == 2:
-                yield ((sr, sc), (tr, tc), None)
+                if not captures_only:
+                    yield ((sr, sc), (tr, tc), None)
                 continue
 
             if _is_square_attacked_ignoring_square(board, tr, tc, opp, kpos):
@@ -629,7 +719,10 @@ def _generate_legal_moves(board, color):
         yield ((sr, sc), (tr, tc), promo)
 
 def get_all_legal_moves(board, color):
-    return list(_generate_legal_moves(board, color))
+    return list(_generate_legal_moves(board, color, captures_only=False))
+
+def get_all_legal_captures(board, color):
+    return list(_generate_legal_moves(board, color, captures_only=True))
 
 def has_legal_moves(board, color):
     for _ in _generate_legal_moves(board, color):
@@ -692,7 +785,7 @@ def get_game_state(board, turn_to_move, position_counts, ply_count=0, max_moves=
 
     return "ongoing", None
 
-# --- Static Exchange Evaluation (SEE) ---
+# --- Fast Static Exchange Evaluation (SEE) ---
 _SEE_VALUES = [100, 320, 330, 500, 950, 20000]
 
 def _attackers_to_square(board, r, c, color):
@@ -737,7 +830,6 @@ def _attackers_to_square(board, r, c, color):
     return attackers
 
 def static_exchange_eval(board, move, moving_piece, target_piece):
-    """Calculates net material outcome of all exchanges on move destination square."""
     if target_piece is None:
         if moving_piece.z_idx == 0 and move[1] == board.ep_square:
             return _SEE_VALUES[0]
@@ -775,7 +867,6 @@ def static_exchange_eval(board, move, moving_piece, target_piece):
     return result
 
 def fast_approximate_material_swing(board, move, moving_piece, target_piece, piece_values_list):
-    """Evaluates capture quality using SEE."""
     if target_piece is not None or (moving_piece.z_idx == 0 and move[1] == board.ep_square):
         see = static_exchange_eval(board, move, moving_piece, target_piece)
         is_tactic = (see >= 0)

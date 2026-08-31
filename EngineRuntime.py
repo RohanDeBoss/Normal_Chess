@@ -1,4 +1,4 @@
-# EngineRuntime.py (v1.6 - Parameterized Fullmove FEN counter + JIT compiler trick)
+# EngineRuntime.py (v1.7 - Bugfix for incremental hash)
 
 import glob
 import inspect
@@ -71,9 +71,10 @@ def incremental_hash(parent_hash, record_tuple):
 
     h ^= arr[c_idx][mp_piece.z_idx][start[0]][start[1]]
 
-    if special == 3:
-        h ^= arr[c_idx][4][end[0]][end[1]]
-    else:
+    if special == 3 and added:
+        promoted_piece = added[0][0]
+        h ^= arr[c_idx][promoted_piece.z_idx][end[0]][end[1]]
+    elif special != 3:
         h ^= arr[c_idx][mp_piece.z_idx][end[0]][end[1]]
 
     for p, r, c in removed:

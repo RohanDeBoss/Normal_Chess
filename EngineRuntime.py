@@ -1,4 +1,4 @@
-# EngineRuntime.py (v1.7 - Bugfix for incremental hash)
+# EngineRuntime.py (v1.8 - Allow for 3 tuple)
 
 import glob
 import inspect
@@ -352,7 +352,8 @@ def generate_series_opening_sequence(board, num_plies=2):
             break
         move = random.choice(moves)
         opening_sequence.append(move)
-        temp_board.make_move(move[0], move[1])
+        promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+        temp_board.make_move(move[0], move[1], promo)
         temp_turn = "black" if temp_turn == "white" else "white"
     return opening_sequence
 
@@ -417,7 +418,8 @@ TT_FLAG_EXACT, TT_FLAG_LOWERBOUND, TT_FLAG_UPPERBOUND = 0, 1, 2
 def format_bot_move(bot, board_before, move):
     if not move: return "None"
     child = board_before.clone()
-    child.make_move(move[0], move[1])
+    promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+    child.make_move(move[0], move[1], promo)
     return format_move_san(board_before, child, move)
 
 def get_pv_data(bot, max_depth, root_move):
@@ -448,7 +450,8 @@ def get_pv_data(bot, max_depth, root_move):
             pv_san.append(f"{move_num}... {san}" if i == 0 else san)
 
         pv_raw.append(move)
-        current_board.make_move(move[0], move[1])
+        promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+        current_board.make_move(move[0], move[1], promo)
         current_turn = 'black' if current_turn == 'white' else 'white'
         current_ply += 1
 

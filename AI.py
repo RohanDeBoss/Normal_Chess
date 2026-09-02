@@ -1,4 +1,4 @@
-# AI.py (v2.0 - Lean Eval, SEE Move Ordering, Capture-Only QSearch and bottleneck removed)
+# AI.py (v2.21 - Actually checkmate + Bugfixes from wave 2)
 
 import time
 import random
@@ -521,7 +521,7 @@ class ChessBot:
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
         if ply > 0:
-            if hash_val in self.position_counts:
+            if self.position_counts.get(hash_val, 0) >= 2:
                 return self.DRAW_SCORE
             if hash_val in search_path:
                 return self.DRAW_SCORE
@@ -736,7 +736,7 @@ class ChessBot:
                     return best_score
 
             if legal_moves_count == 0:
-                return -self.MATE_SCORE + ply
+                return -self.MATE_SCORE + ply if is_in_check_flag else self.DRAW_SCORE
 
             sto = best_score
             if sto >  self.MATE_SCORE - 1000: sto = best_score + ply
@@ -755,7 +755,7 @@ class ChessBot:
                 raise SearchCancelledException()
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
-        if ply > 0 and hash_val in self.position_counts:
+        if ply > 0 and self.position_counts.get(hash_val, 0) >= 2:
             return self.DRAW_SCORE
 
         tt_idx = self._tt_probe(hash_val)
@@ -922,10 +922,18 @@ class ChessBot:
 
         w_pawn_files = [0] * 8
         b_pawn_files = [0] * 8
+        w_max_pawn_r = [-1] * 8
+        b_min_pawn_r = [8] * 8
         for p in board.white_pieces:
-            if p.z_idx == 0: w_pawn_files[p.pos[1]] += 1
+            if p.z_idx == 0:
+                pr, pc = p.pos
+                w_pawn_files[pc] += 1
+                if pr > w_max_pawn_r[pc]: w_max_pawn_r[pc] = pr
         for p in board.black_pieces:
-            if p.z_idx == 0: b_pawn_files[p.pos[1]] += 1
+            if p.z_idx == 0:
+                pr, pc = p.pos
+                b_pawn_files[pc] += 1
+                if pr < b_min_pawn_r[pc]: b_min_pawn_r[pc] = pr
 
         for color_idx in (0, 1):
             pieces   = piece_lists[color_idx]
@@ -949,16 +957,19 @@ class ChessBot:
                 if z == 0:
                     advancement = (7 - r) if is_white else r
 
-                    # Passed pawn
+                    # Fast O(1) Passed pawn check
                     is_passed = True
-                    for fc in range(max(0, c - 1), min(8, c + 2)):
-                        opp_pieces = board.black_pieces if is_white else board.white_pieces
-                        for opp_p in opp_pieces:
-                            if opp_p.z_idx == 0 and opp_p.pos[1] == fc:
-                                if (is_white and opp_p.pos[0] < r) or (not is_white and opp_p.pos[0] > r):
-                                    is_passed = False
-                                    break
-                        if not is_passed: break
+                    if is_white:
+                        for fc in range(max(0, c - 1), min(8, c + 2)):
+                            if b_min_pawn_r[fc] < r:
+                                is_passed = False
+                                break
+                    else:
+                        for fc in range(max(0, c - 1), min(8, c + 2)):
+                            if w_max_pawn_r[fc] > r:
+                                is_passed = False
+                                break
+
                     if is_passed and advancement < len(self.EVAL_PASSED_PAWN_RANK):
                         scores_eg[color_idx] += self.EVAL_PASSED_PAWN_RANK[advancement]
 

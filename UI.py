@@ -1,4 +1,4 @@
-# ChessUI.py (v2 - Castling fen parsing correct)
+# ChessUI.py (v2.11 Fixes from wave 2)
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -745,7 +745,8 @@ class EnhancedChessApp:
             san_map  = {}
             for m in get_all_legal_moves(self.board, self.turn):
                 child = self.board.clone()
-                child.make_move(m[0], m[1])
+                promo = m[2] if len(m) > 2 and m[2] is not None else Queen
+                child.make_move(m[0], m[1], promo)
                 san_map[format_move_san(self.board, child, m)] = m
             matched_move = matched_san = None
             for san in sorted(san_map, key=len, reverse=True):
@@ -755,7 +756,8 @@ class EnhancedChessApp:
                     matched_san  = san
                     break
             if matched_move:
-                self.board.make_move(matched_move[0], matched_move[1])
+                promo = matched_move[2] if len(matched_move) > 2 and matched_move[2] is not None else Queen
+                self.board.make_move(matched_move[0], matched_move[1], promo)
                 self.execute_move_and_check_state(self.turn, matched_move)
                 pgn_text = pgn_text[len(matched_san):]
                 if self.game_over:
@@ -848,7 +850,8 @@ class EnhancedChessApp:
         if self.game_over:
             return
         if the_move:
-            self.board.make_move(the_move[0], the_move[1])
+            promo = the_move[2] if len(the_move) > 2 and the_move[2] is not None else Queen
+            self.board.make_move(the_move[0], the_move[1], promo)
             self.execute_move_and_check_state(self.turn, the_move)
 
             if not self.game_over and self.game_mode.get() == GameMode.HUMAN_VS_BOT.value and self.turn == self.human_color:
@@ -857,9 +860,10 @@ class EnhancedChessApp:
                     self.premove = None
                     start_pos, end_pos = pm[0], pm[1]
                     promo_cls = pm[2] if len(pm) > 2 else Queen
-                    if (start_pos, end_pos) in get_all_legal_moves(self.board, self.turn):
+                    legal_moves = get_all_legal_moves(self.board, self.turn)
+                    if any(m[0] == start_pos and m[1] == end_pos for m in legal_moves):
                         self._apply_move_with_promotion(start_pos, end_pos, promo_cls)
-                        self.execute_move_and_check_state(self.turn, (start_pos, end_pos))
+                        self.execute_move_and_check_state(self.turn, (start_pos, end_pos, promo_cls))
                         if not self.game_over and self.turn != self.human_color:
                             self.set_interactivity(False)
                             self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
@@ -951,9 +955,9 @@ class EnhancedChessApp:
             self.drag_start = (r, c)
             self.dragging = True
             all_pseudo = get_all_pseudo_legal_moves(self.board, self.human_color)
-            self.valid_moves_for_highlight = [e for s, e in all_pseudo if s == self.selected]
+            self.valid_moves_for_highlight = [m[1] for m in all_pseudo if m[0] == self.selected]
             dests = self._get_premove_destinations(piece, (r, c))
-            self.valid_moves = [(self.selected, d) for d in dests]
+            self.valid_moves = [(self.selected, d, None) for d in dests]
             self.drag_piece_ghost = self.canvas.create_text(
                 event.x, event.y, text=piece.symbol(),
                 font=("Arial Unicode MS", int(self.square_size * 0.7)),
@@ -970,7 +974,7 @@ class EnhancedChessApp:
         self.drag_start = (r, c)
         self.dragging  = True
         self.valid_moves = get_all_legal_moves(self.board, self.turn)
-        self.valid_moves_for_highlight = [e for s, e in self.valid_moves if s == self.selected]
+        self.valid_moves_for_highlight = [m[1] for m in self.valid_moves if m[0] == self.selected]
         self.drag_piece_ghost = self.canvas.create_text(
             event.x, event.y, text=piece.symbol(),
             font=("Arial Unicode MS", int(self.square_size * 0.7)),
@@ -1009,7 +1013,7 @@ class EnhancedChessApp:
 
         # Enforce piece movement rules for premoves
         if is_premove:
-            if (start_pos, end_pos) in self.valid_moves:
+            if any(m[0] == start_pos and m[1] == end_pos for m in self.valid_moves):
                 promo_cls = self.check_and_prompt_promotion(start_pos, end_pos)
                 if promo_cls is not False:
                     self.premove = (start_pos, end_pos, promo_cls)
@@ -1021,7 +1025,8 @@ class EnhancedChessApp:
             return
 
         current_legal = get_all_legal_moves(self.board, self.turn)
-        if (start_pos, end_pos) in current_legal:
+        matched_move = next((m for m in current_legal if m[0] == start_pos and m[1] == end_pos), None)
+        if matched_move is not None:
             promo_cls = self.check_and_prompt_promotion(start_pos, end_pos)
             if promo_cls is False:
                 self.drag_start = None
@@ -1031,8 +1036,10 @@ class EnhancedChessApp:
                 self.draw_board()
                 return
 
-            self._apply_move_with_promotion(start_pos, end_pos, promo_cls)
-            self.execute_move_and_check_state(self.turn, (start_pos, end_pos))
+            actual_promo = promo_cls if promo_cls is not None else matched_move[2]
+            move_tuple = (start_pos, end_pos, actual_promo)
+            self._apply_move_with_promotion(start_pos, end_pos, actual_promo)
+            self.execute_move_and_check_state(self.turn, move_tuple)
             if not self.game_over:
                 if mode == GameMode.HUMAN_VS_BOT.value and self.turn != self.human_color:
                     self.drag_start = None
@@ -1103,12 +1110,10 @@ class EnhancedChessApp:
         return chosen[0]
 
     def _apply_move_with_promotion(self, start_pos, end_pos, promo_cls):
-        try:
-            self.board.make_move(start_pos, end_pos, promo_cls)
-        except TypeError:
-            self.board.make_move(start_pos, end_pos)
-            if promo_cls:
-                self.board.grid[end_pos[0]][end_pos[1]] = promo_cls(self.turn)
+        if promo_cls is False:
+            return
+        promo = promo_cls if promo_cls is not None else Queen
+        self.board.make_move(start_pos, end_pos, promo)
 
     def run_move_checker(self):
         depth = int(self.bot_depth_slider.get())
@@ -1268,7 +1273,7 @@ class EnhancedChessApp:
             piece = self.board.grid[r][c]
             if piece and piece.color == self.turn:
                 self.valid_moves = get_all_legal_moves(self.board, self.turn)
-                self.valid_moves_for_highlight = [e for s, e in self.valid_moves if s == self.selected]
+                self.valid_moves_for_highlight = [m[1] for m in self.valid_moves if m[0] == self.selected]
             else:
                 self.dragging = False
                 self.drag_start = None
@@ -1916,9 +1921,10 @@ class EnhancedChessApp:
         self._pause_clock()
         for move in self.current_opening_sequence:
             child = self.board.clone()
-            child.make_move(move[0], move[1])
+            promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+            child.make_move(move[0], move[1], promo)
             print(f"Opening: {format_move_san(self.board, child, move)}")
-            self.board.make_move(move[0], move[1])
+            self.board.make_move(move[0], move[1], promo)
             self.execute_move_and_check_state(self.turn, move)
             if self.game_over:
                 break
@@ -2001,7 +2007,9 @@ class EnhancedChessApp:
         self.tt_canvas.pack()
         tt_sim = self.board.clone()
         for i in range(move_idx + 1):
-            tt_sim.make_move(*self.current_pv_raw[i])
+            m = self.current_pv_raw[i]
+            promo = m[2] if len(m) > 2 and m[2] is not None else Queen
+            tt_sim.make_move(m[0], m[1], promo)
         self._draw_tt_board_static(tt_sim, self.current_pv_raw[move_idx])
 
     def on_pv_hover_leave(self, event, tag):
@@ -2016,10 +2024,12 @@ class EnhancedChessApp:
         C1, C2 = "#D2B48C", "#8B5A2B"
         flipped_last_move = None
         if last_move:
+            # Only unpack the coordinate pairs (start, end), ignoring promo
+            squares = last_move[:2]
             if self.board_orientation == "black":
-                flipped_last_move = [((ROWS - 1 - r), (COLS - 1 - c)) for r, c in last_move]
+                flipped_last_move = [((ROWS - 1 - r), (COLS - 1 - c)) for r, c in squares]
             else:
-                flipped_last_move = last_move
+                flipped_last_move = squares
         
         for r in range(ROWS):
             for c in range(COLS):

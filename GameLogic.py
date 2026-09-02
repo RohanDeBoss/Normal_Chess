@@ -1,4 +1,4 @@
-# GameLogic.py (v1.3 - High Performance Standard Chess Rules & Capture-Only Movegen)
+# GameLogic.py (v1.5 - Improvements to performance + Bugfixes from wave)
 
 ROWS, COLS = 8, 8
 SQUARE_SIZE = 75
@@ -14,30 +14,47 @@ DIRECTIONS = {
     'knight': ((2, 1), (2, -1), (-2, 1), (-2, -1), (1, 2), (1, -2), (-1, 2), (-1, -2)),
 }
 
-KNIGHT_ATTACKS_FROM = {
-    (r, c): tuple(
-        (r + dr, c + dc) for dr, dc in DIRECTIONS['knight']
-        if 0 <= r + dr < ROWS and 0 <= c + dc < COLS
-    )
-    for r in range(ROWS) for c in range(COLS)
-}
-
-KING_ATTACKS_FROM = {
-    (r, c): tuple(
-        (r + dr, c + dc) for dr, dc in DIRECTIONS['king']
-        if 0 <= r + dr < ROWS and 0 <= c + dc < COLS
-    )
-    for r in range(ROWS) for c in range(COLS)
-}
+KNIGHT_ATTACKS_SQ = [None] * 64
+KING_ATTACKS_SQ   = [None] * 64
+PAWN_ATTACKS_SQ   = {'white': [None] * 64, 'black': [None] * 64}
 
 RAYS_ORTHOGONAL = [None] * 64
 RAYS_DIAGONAL   = [None] * 64
 RAYS_ALL        = [None] * 64
 
-def _init_rays():
+def _init_tables():
     for r in range(ROWS):
         for c in range(COLS):
-            sq = r * COLS + c
+            sq = r * 8 + c
+            
+            # Knight attacks
+            k_moves = []
+            for dr, dc in DIRECTIONS['knight']:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < 8 and 0 <= nc < 8:
+                    k_moves.append((nr, nc))
+            KNIGHT_ATTACKS_SQ[sq] = tuple(k_moves)
+
+            # King attacks
+            kg_moves = []
+            for dr, dc in DIRECTIONS['king']:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < 8 and 0 <= nc < 8:
+                    kg_moves.append((nr, nc))
+            KING_ATTACKS_SQ[sq] = tuple(kg_moves)
+
+            # Pawn attacks
+            w_pawn_caps = []
+            b_pawn_caps = []
+            for dc in (-1, 1):
+                if 0 <= r + 1 < 8 and 0 <= c + dc < 8:
+                    w_pawn_caps.append((r + 1, c + dc))
+                if 0 <= r - 1 < 8 and 0 <= c + dc < 8:
+                    b_pawn_caps.append((r - 1, c + dc))
+            PAWN_ATTACKS_SQ['white'][sq] = tuple(w_pawn_caps)
+            PAWN_ATTACKS_SQ['black'][sq] = tuple(b_pawn_caps)
+
+            # Ray attacks
             ortho = []
             diag  = []
             for dr, dc in DIRECTIONS['rook']:
@@ -58,7 +75,10 @@ def _init_rays():
             RAYS_DIAGONAL[sq]   = tuple(diag)
             RAYS_ALL[sq]        = tuple(ortho + diag)
 
-_init_rays()
+_init_tables()
+
+KNIGHT_ATTACKS_FROM = {(sq // 8, sq % 8): KNIGHT_ATTACKS_SQ[sq] for sq in range(64)}
+KING_ATTACKS_FROM   = {(sq // 8, sq % 8): KING_ATTACKS_SQ[sq] for sq in range(64)}
 
 
 def _clone_piece_fast(piece):
@@ -214,17 +234,7 @@ class Board:
         self.grid[end[0]][end[1]]     = piece
 
     def find_king_pos(self, color):
-        k = self.white_king_pos if color == 'white' else self.black_king_pos
-        if k is not None and self.grid[k[0]][k[1]] and self.grid[k[0]][k[1]].z_idx == 5:
-            return k
-        for r in range(ROWS):
-            for c in range(COLS):
-                p = self.grid[r][c]
-                if p and p.z_idx == 5 and p.color == color:
-                    if color == 'white': self.white_king_pos = (r, c)
-                    else:                self.black_king_pos = (r, c)
-                    return (r, c)
-        return None
+        return self.white_king_pos if color == 'white' else self.black_king_pos
 
     def clone(self):
         new_board                 = Board.__new__(Board)
@@ -361,24 +371,22 @@ class Board:
 # -----------------------------------------------------------------------
 def is_square_attacked(board, r, c, attacking_color):
     grid = board.grid
+    sq = r * 8 + c
 
-    # 1. Pawn Attacks
-    p_dir = 1 if attacking_color == 'white' else -1
-    for dc in (-1, 1):
-        pr, pc = r + p_dir, c + dc
-        if 0 <= pr < 8 and 0 <= pc < 8:
-            p = grid[pr][pc]
-            if p and p.z_idx == 0 and p.color == attacking_color:
-                return True
+    # 1. Pawn Attacks (Flat Table)
+    for pr, pc in PAWN_ATTACKS_SQ[attacking_color][sq]:
+        p = grid[pr][pc]
+        if p and p.z_idx == 0 and p.color == attacking_color:
+            return True
 
-    # 2. Knight Attacks
-    for kr, kc in KNIGHT_ATTACKS_FROM[(r, c)]:
+    # 2. Knight Attacks (Flat Table)
+    for kr, kc in KNIGHT_ATTACKS_SQ[sq]:
         p = grid[kr][kc]
         if p and p.z_idx == 1 and p.color == attacking_color:
             return True
 
-    # 3. King Attacks
-    for kr, kc in KING_ATTACKS_FROM[(r, c)]:
+    # 3. King Attacks (Flat Table)
+    for kr, kc in KING_ATTACKS_SQ[sq]:
         p = grid[kr][kc]
         if p and p.z_idx == 5 and p.color == attacking_color:
             return True
@@ -445,7 +453,7 @@ def get_all_pseudo_legal_moves(board, color):
                         moves.append(((r, c), (cr, cc), None))
 
         elif pz == 1: # Knight
-            for kr, kc in KNIGHT_ATTACKS_FROM[(r, c)]:
+            for kr, kc in KNIGHT_ATTACKS_SQ[sq]:
                 target = grid[kr][kc]
                 if target is None or target.color == opp:
                     moves.append(((r, c), (kr, kc), None))
@@ -478,24 +486,24 @@ def get_all_pseudo_legal_moves(board, color):
                         break
 
         elif pz == 5: # King
-            for kr, kc in KING_ATTACKS_FROM[(r, c)]:
+            for kr, kc in KING_ATTACKS_SQ[sq]:
                 target = grid[kr][kc]
                 if target is None or target.color == opp:
                     moves.append(((r, c), (kr, kc), None))
 
-            # Castling
+            # Castling (with rook presence validation)
             if color == 'white' and r == 7 and c == 4 and not is_in_check(board, 'white'):
-                if (board.castling_rights & CASTLE_WK) and grid[7][5] is None and grid[7][6] is None:
+                if (board.castling_rights & CASTLE_WK) and grid[7][7] and grid[7][7].z_idx == 3 and grid[7][7].color == 'white' and grid[7][5] is None and grid[7][6] is None:
                     if not is_square_attacked(board, 7, 5, 'black') and not is_square_attacked(board, 7, 6, 'black'):
                         moves.append(((7, 4), (7, 6), None))
-                if (board.castling_rights & CASTLE_WQ) and grid[7][3] is None and grid[7][2] is None and grid[7][1] is None:
+                if (board.castling_rights & CASTLE_WQ) and grid[7][0] and grid[7][0].z_idx == 3 and grid[7][0].color == 'white' and grid[7][3] is None and grid[7][2] is None and grid[7][1] is None:
                     if not is_square_attacked(board, 7, 3, 'black') and not is_square_attacked(board, 7, 2, 'black'):
                         moves.append(((7, 4), (7, 2), None))
             elif color == 'black' and r == 0 and c == 4 and not is_in_check(board, 'black'):
-                if (board.castling_rights & CASTLE_BK) and grid[0][5] is None and grid[0][6] is None:
+                if (board.castling_rights & CASTLE_BK) and grid[0][7] and grid[0][7].z_idx == 3 and grid[0][7].color == 'black' and grid[0][5] is None and grid[0][6] is None:
                     if not is_square_attacked(board, 0, 5, 'white') and not is_square_attacked(board, 0, 6, 'white'):
                         moves.append(((0, 4), (0, 6), None))
-                if (board.castling_rights & CASTLE_BQ) and grid[0][3] is None and grid[0][2] is None and grid[0][1] is None:
+                if (board.castling_rights & CASTLE_BQ) and grid[0][0] and grid[0][0].z_idx == 3 and grid[0][0].color == 'black' and grid[0][3] is None and grid[0][2] is None and grid[0][1] is None:
                     if not is_square_attacked(board, 0, 3, 'white') and not is_square_attacked(board, 0, 2, 'white'):
                         moves.append(((0, 4), (0, 2), None))
 
@@ -535,7 +543,7 @@ def get_pseudo_legal_captures(board, color):
                         moves.append(((r, c), (cr, cc), None))
 
         elif pz == 1: # Knight
-            for kr, kc in KNIGHT_ATTACKS_FROM[(r, c)]:
+            for kr, kc in KNIGHT_ATTACKS_SQ[sq]:
                 target = grid[kr][kc]
                 if target and target.color == opp:
                     moves.append(((r, c), (kr, kc), None))
@@ -568,7 +576,7 @@ def get_pseudo_legal_captures(board, color):
                         break
 
         elif pz == 5: # King
-            for kr, kc in KING_ATTACKS_FROM[(r, c)]:
+            for kr, kc in KING_ATTACKS_SQ[sq]:
                 target = grid[kr][kc]
                 if target and target.color == opp:
                     moves.append(((r, c), (kr, kc), None))
@@ -596,17 +604,14 @@ def _compute_check_and_pins(board, color):
 
     checkers = []
 
-    # Pawn checks
-    p_dir = 1 if opp == 'white' else -1
-    for dc in (-1, 1):
-        pr, pc = kr + p_dir, kc + dc
-        if 0 <= pr < 8 and 0 <= pc < 8:
-            p = grid[pr][pc]
-            if p and p.z_idx == 0 and p.color == opp:
-                checkers.append((p, pr, pc))
+    # Pawn checks (Flat Table)
+    for pr, pc in PAWN_ATTACKS_SQ[opp][sq]:
+        p = grid[pr][pc]
+        if p and p.z_idx == 0 and p.color == opp:
+            checkers.append((p, pr, pc))
 
-    # Knight checks
-    for kr2, kc2 in KNIGHT_ATTACKS_FROM[(kr, kc)]:
+    # Knight checks (Flat Table)
+    for kr2, kc2 in KNIGHT_ATTACKS_SQ[sq]:
         p = grid[kr2][kc2]
         if p and p.z_idx == 1 and p.color == opp:
             checkers.append((p, kr2, kc2))
@@ -652,7 +657,7 @@ def _generate_legal_moves(board, color, captures_only=False):
     num_checkers = len(checkers)
 
     if num_checkers >= 2:
-        for tr, tc in KING_ATTACKS_FROM[(kr, kc)]:
+        for tr, tc in KING_ATTACKS_SQ[kr * 8 + kc]:
             target = grid[tr][tc]
             if target is None or target.color == opp:
                 if captures_only and (target is None or target.color != opp):
@@ -788,32 +793,34 @@ def get_game_state(board, turn_to_move, position_counts, ply_count=0, max_moves=
 # --- Fast Static Exchange Evaluation (SEE) ---
 _SEE_VALUES = [100, 320, 330, 500, 950, 20000]
 
-def _attackers_to_square(board, r, c, color):
+def _attackers_to_square(board, r, c, color, occupied_override=None):
     grid = board.grid
     attackers = []
+    sq = r * 8 + c
 
-    p_dir = 1 if color == 'white' else -1
-    for dc in (-1, 1):
-        pr, pc = r + p_dir, c + dc
-        if 0 <= pr < 8 and 0 <= pc < 8:
-            p = grid[pr][pc]
-            if p and p.z_idx == 0 and p.color == color:
-                attackers.append((_SEE_VALUES[0], pr, pc, 0))
+    def get_piece(pr, pc):
+        if occupied_override and (pr, pc) in occupied_override:
+            return occupied_override[(pr, pc)]
+        return grid[pr][pc]
 
-    for kr, kc in KNIGHT_ATTACKS_FROM[(r, c)]:
-        p = grid[kr][kc]
+    for pr, pc in PAWN_ATTACKS_SQ[color][sq]:
+        p = get_piece(pr, pc)
+        if p and p.z_idx == 0 and p.color == color:
+            attackers.append((_SEE_VALUES[0], pr, pc, 0))
+
+    for kr, kc in KNIGHT_ATTACKS_SQ[sq]:
+        p = get_piece(kr, kc)
         if p and p.z_idx == 1 and p.color == color:
             attackers.append((_SEE_VALUES[1], kr, kc, 1))
 
-    for kr, kc in KING_ATTACKS_FROM[(r, c)]:
-        p = grid[kr][kc]
+    for kr, kc in KING_ATTACKS_SQ[sq]:
+        p = get_piece(kr, kc)
         if p and p.z_idx == 5 and p.color == color:
             attackers.append((_SEE_VALUES[5], kr, kc, 5))
 
-    sq = r * 8 + c
     for ray in RAYS_ORTHOGONAL[sq]:
         for cr, cc in ray:
-            p = grid[cr][cc]
+            p = get_piece(cr, cc)
             if p:
                 if p.color == color and (p.z_idx == 3 or p.z_idx == 4):
                     attackers.append((_SEE_VALUES[p.z_idx], cr, cc, p.z_idx))
@@ -821,7 +828,7 @@ def _attackers_to_square(board, r, c, color):
 
     for ray in RAYS_DIAGONAL[sq]:
         for cr, cc in ray:
-            p = grid[cr][cc]
+            p = get_piece(cr, cc)
             if p:
                 if p.color == color and (p.z_idx == 2 or p.z_idx == 4):
                     attackers.append((_SEE_VALUES[p.z_idx], cr, cc, p.z_idx))
@@ -840,8 +847,7 @@ def static_exchange_eval(board, move, moving_piece, target_piece):
     occupied_override = {(sr, sc): None, (tr, tc): moving_piece}
 
     def attackers_live(color):
-        raw = _attackers_to_square(board, tr, tc, color)
-        return [a for a in raw if (a[1], a[2]) not in occupied_override or occupied_override[(a[1], a[2])] is not None]
+        return _attackers_to_square(board, tr, tc, color, occupied_override)
 
     gains = [_SEE_VALUES[target_piece.z_idx]]
     side_to_move = moving_piece.opponent_color
@@ -856,8 +862,9 @@ def static_exchange_eval(board, move, moving_piece, target_piece):
 
         gains.append(current_attacker_value - gains[-1])
 
+        moving_p = occupied_override.get((fr, fc), grid[fr][fc])
         occupied_override[(fr, fc)] = None
-        occupied_override[(tr, tc)] = grid[fr][fc]
+        occupied_override[(tr, tc)] = moving_p
         current_attacker_value = value
         side_to_move = 'black' if side_to_move == 'white' else 'white'
 
@@ -867,13 +874,20 @@ def static_exchange_eval(board, move, moving_piece, target_piece):
     return result
 
 def fast_approximate_material_swing(board, move, moving_piece, target_piece, piece_values_list):
-    if target_piece is not None or (moving_piece.z_idx == 0 and move[1] == board.ep_square):
-        see = static_exchange_eval(board, move, moving_piece, target_piece)
-        is_tactic = (see >= 0)
-        return see, is_tactic
+    is_pawn = (moving_piece.z_idx == 0)
+    promo_bonus = (piece_values_list[4] - piece_values_list[0]) if (is_pawn and move[1][0] == moving_piece.promo_rank) else 0
 
-    if moving_piece.z_idx == 0 and move[1][0] == moving_piece.promo_rank:
-        return piece_values_list[4] - piece_values_list[0], True
+    if target_piece is not None:
+        if piece_values_list[target_piece.z_idx] >= piece_values_list[moving_piece.z_idx]:
+            return piece_values_list[target_piece.z_idx] - piece_values_list[moving_piece.z_idx] + promo_bonus, True
+        see = static_exchange_eval(board, move, moving_piece, target_piece) + promo_bonus
+        return see, (see >= 0)
+
+    if is_pawn and move[1] == board.ep_square:
+        return piece_values_list[0], True
+
+    if promo_bonus > 0:
+        return promo_bonus, True
 
     return 0, False
 

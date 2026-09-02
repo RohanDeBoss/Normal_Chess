@@ -1,4 +1,4 @@
-# EngineRuntime.py (v1.8 - Allow for 3 tuple)
+# EngineRuntime.py (v1.9 - Lots of stuff to speed things up idk)
 
 import glob
 import inspect
@@ -64,23 +64,21 @@ def board_hash(board, turn):
     return h
 
 def incremental_hash(parent_hash, record_tuple):
-    start, end, mp_piece, removed, added, old_c, old_ep, _, special, new_c, new_ep = record_tuple
+    start, end, mp_piece, rem_p, rem_pos, add_p, old_c, old_ep, _, special, new_c, new_ep = record_tuple
     h = parent_hash ^ ZOBRIST_TURN
     arr = ZOBRIST_ARRAY
     c_idx = 0 if mp_piece.color == "white" else 1
 
     h ^= arr[c_idx][mp_piece.z_idx][start[0]][start[1]]
 
-    if special == 3 and added:
-        promoted_piece = added[0][0]
-        h ^= arr[c_idx][promoted_piece.z_idx][end[0]][end[1]]
+    if special == 3 and add_p is not None:
+        h ^= arr[c_idx][add_p.z_idx][end[0]][end[1]]
     elif special != 3:
         h ^= arr[c_idx][mp_piece.z_idx][end[0]][end[1]]
 
-    for p, r, c in removed:
-        if p is not None and p is not mp_piece:
-            pc_idx = 0 if p.color == "white" else 1
-            h ^= arr[pc_idx][p.z_idx][r][c]
+    if rem_p is not None:
+        pc_idx = 0 if rem_p.color == "white" else 1
+        h ^= arr[pc_idx][rem_p.z_idx][rem_pos[0]][rem_pos[1]]
 
     if special == 1:
         sr = start[0]

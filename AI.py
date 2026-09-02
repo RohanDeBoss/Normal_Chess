@@ -1,4 +1,4 @@
-# AI.py (v2.21 - Actually checkmate + Bugfixes from wave 2)
+# AI.py (v2.3 - Lots of stuff to speed things up idk)
 
 import time
 import random
@@ -52,10 +52,14 @@ ORDERING_VALUES = [
 INITIAL_PHASE_MATERIAL = (MG_PIECE_VALUES[Knight] * 4 + MG_PIECE_VALUES[Bishop] * 4 +
                           MG_PIECE_VALUES[Rook] * 4 + MG_PIECE_VALUES[Queen] * 2)
 
+MATE_SCORE = 1000000
+DRAW_SCORE = 0
+MATE_BOUND = 999000
+
 class ChessBot:
     search_depth = 6
-    MATE_SCORE = 1000000
-    DRAW_SCORE = 0
+    MATE_SCORE = MATE_SCORE
+    DRAW_SCORE = DRAW_SCORE
 
     MAX_Q_SEARCH_DEPTH = 12
     LMR_DEPTH_THRESHOLD = 3
@@ -535,8 +539,8 @@ class ChessBot:
 
         if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth:
             tt_score = self.tt_scores[tt_idx]
-            if tt_score >  self.MATE_SCORE - 1000: tt_score -= ply
-            elif tt_score < -self.MATE_SCORE + 1000: tt_score += ply
+            if tt_score > MATE_BOUND: tt_score -= ply
+            elif tt_score < -MATE_BOUND: tt_score += ply
 
             self.used_heuristic_eval = True
 
@@ -566,7 +570,7 @@ class ChessBot:
 
         try:
             if (self.USE_REVERSE_FUTILITY_PRUNING and depth <= self.RFP_MAX_DEPTH and
-                    not is_in_check_flag and ply > 0 and abs(beta) < self.MATE_SCORE - 1000
+                    not is_in_check_flag and ply > 0 and abs(beta) < MATE_BOUND
                     and total_pieces > 6):
                 static_eval = self._peek_eval_tt(hash_val)
                 if static_eval is not None:
@@ -575,11 +579,11 @@ class ChessBot:
                         return static_eval - rfp_margin
 
             if (self.USE_NULL_MOVE_PRUNING and depth >= self.NMP_MIN_DEPTH and
-                    ply > 0 and not is_in_check_flag and abs(beta) < self.MATE_SCORE - 1000
+                    ply > 0 and not is_in_check_flag and abs(beta) < MATE_BOUND
                     and total_pieces > 6):
-                pc = board.piece_counts_z
-                if (pc['white'][1] + pc['white'][2] + pc['white'][3] + pc['white'][4] > 0 and
-                        pc['black'][1] + pc['black'][2] + pc['black'][3] + pc['black'][4] > 0):
+                pc_w, pc_b = board.pc_w, board.pc_b
+                if (pc_w[1] + pc_w[2] + pc_w[3] + pc_w[4] > 0 and
+                        pc_b[1] + pc_b[2] + pc_b[3] + pc_b[4] > 0):
                     self.used_heuristic_eval = True
                     if static_eval is None:
                         static_eval = self._get_cached_static_eval(board, turn, hash_val)
@@ -598,11 +602,11 @@ class ChessBot:
                         finally:
                             board.ep_square = saved_ep
                         if score >= beta: 
-                            return score if score < self.MATE_SCORE - 1000 else beta
+                            return score if score < MATE_BOUND else beta
 
             futility_prune = False
             if (self.USE_FUTILITY_PRUNING and depth == 1 and not is_in_check_flag and
-                    abs(alpha) < self.MATE_SCORE - 1000 and total_pieces > 6):
+                    abs(alpha) < MATE_BOUND and total_pieces > 6):
                 self.used_heuristic_eval = True
                 if static_eval is None:
                     static_eval = self._get_cached_static_eval(board, turn, hash_val)
@@ -656,10 +660,10 @@ class ChessBot:
                     is_killer = False
                     if ply < len(self.killer_moves):
                         k0, k1 = self.killer_moves[ply]
-                        is_killer = (k0 is not None and move[:2] == k0[:2]) or \
-                                    (k1 is not None and move[:2] == k1[:2])
+                        is_killer = (k0 is not None and move[0] == k0[0] and move[1] == k0[1]) or \
+                                    (k1 is not None and move[0] == k1[0] and move[1] == k1[1])
 
-                    if is_killer or (c_move and move[:2] == c_move[:2]):
+                    if is_killer or (c_move and move[0] == c_move[0] and move[1] == c_move[1]):
                         reduction -= 1
                         
                     # 10_000 correctly matches the 2,000,000 gravity table scale
@@ -730,17 +734,17 @@ class ChessBot:
                                         ch_table[ft] -= bonus + (ch_table[ft] * bonus) // 64_000
 
                     sto = best_score
-                    if sto >  self.MATE_SCORE - 1000: sto = best_score + ply
-                    elif sto < -self.MATE_SCORE + 1000: sto = best_score - ply
+                    if sto > MATE_BOUND: sto = best_score + ply
+                    elif sto < -MATE_BOUND: sto = best_score - ply
                     self._store_tt(hash_val, sto, depth, TT_FLAG_LOWERBOUND, move)
                     return best_score
 
             if legal_moves_count == 0:
-                return -self.MATE_SCORE + ply if is_in_check_flag else self.DRAW_SCORE
+                return -MATE_SCORE + ply if is_in_check_flag else DRAW_SCORE
 
             sto = best_score
-            if sto >  self.MATE_SCORE - 1000: sto = best_score + ply
-            elif sto < -self.MATE_SCORE + 1000: sto = best_score - ply
+            if sto > MATE_BOUND: sto = best_score + ply
+            elif sto < -MATE_BOUND: sto = best_score - ply
             flag = TT_FLAG_EXACT if best_score > original_alpha else TT_FLAG_UPPERBOUND
             self._store_tt(hash_val, sto, depth, flag, best_move_for_node)
             return best_score
@@ -761,8 +765,8 @@ class ChessBot:
         tt_idx = self._tt_probe(hash_val)
         if tt_idx != -1:
             tt_score = self.tt_scores[tt_idx]
-            if tt_score > self.MATE_SCORE - 1000: tt_score -= ply
-            elif tt_score < -self.MATE_SCORE + 1000: tt_score += ply
+            if tt_score > MATE_BOUND: tt_score -= ply
+            elif tt_score < -MATE_BOUND: tt_score += ply
             tt_flag = self.tt_flags[tt_idx]
             if tt_flag == TT_FLAG_EXACT: return tt_score
             if tt_flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
@@ -790,7 +794,7 @@ class ChessBot:
                 target_piece = grid[r2][c2]
                 swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
                 score = swing * 10 - moving_piece.z_idx
-                if tt_move and move[:2] == tt_move[:2]: score += 1_000_000
+                if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
                 scored_moves.append((score, move))
             scored_moves.sort(key=itemgetter(0), reverse=True)
 
@@ -831,7 +835,7 @@ class ChessBot:
             if stand_pat + swing + 200 < alpha: continue
 
             score = swing * 10 - moving_piece.z_idx
-            if tt_move and move[:2] == tt_move[:2]: score += 1_000_000
+            if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
             scored_moves.append((score, move))
 
         scored_moves.sort(key=itemgetter(0), reverse=True)
@@ -868,7 +872,7 @@ class ChessBot:
 
             swing, is_good_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
 
-            if hash_move and move[:2] == hash_move[:2]:
+            if hash_move and move[0] == hash_move[0] and move[1] == hash_move[1]:
                 score = self.BONUS_PV_MOVE
             elif target_piece is not None or is_good_tactic:
                 if swing > 0:
@@ -877,11 +881,11 @@ class ChessBot:
                     score = 6_000_000 - moving_piece.z_idx
                 else:
                     score = -1_000_000 + swing  # Bad capture: rank below quiet moves
-            elif k1 and move[:2] == k1[:2]:
+            elif k1 and move[0] == k1[0] and move[1] == k1[1]:
                 score = self.BONUS_KILLER_1
-            elif k2 and move[:2] == k2[:2]:
+            elif k2 and move[0] == k2[0] and move[1] == k2[1]:
                 score = self.BONUS_KILLER_2
-            elif counter_move and move[:2] == counter_move[:2]:
+            elif counter_move and move[0] == counter_move[0] and move[1] == counter_move[1]:
                 score = 2_000_000
             else:
                 score = history_table[r1 * 8 + c1][r2 * 8 + c2]

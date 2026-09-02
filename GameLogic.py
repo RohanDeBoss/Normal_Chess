@@ -1,4 +1,4 @@
-# GameLogic.py (v1.5 - Improvements to performance + Bugfixes from wave)
+# GameLogic.py (v1.6 - Lots of stuff to speed things up idk)
 
 ROWS, COLS = 8, 8
 SQUARE_SIZE = 75
@@ -162,7 +162,9 @@ class Board:
         self.black_king_pos   = None
         self.white_pieces     = []
         self.black_pieces     = []
-        self.piece_counts_z   = {'white': [0] * 6, 'black': [0] * 6}
+        self.pc_w             = [0] * 6
+        self.pc_b             = [0] * 6
+        self.piece_counts_z   = {'white': self.pc_w, 'black': self.pc_b}
         self.castling_rights  = 15  # 1111 binary: WK, WQ, BK, BQ
         self.ep_square        = None
         self.halfmove_clock   = 0
@@ -205,7 +207,8 @@ class Board:
         self.grid[r][c] = piece
         piece.pos       = (r, c)
         self._list_append(piece)
-        self.piece_counts_z[piece.color][piece.z_idx] += 1
+        if piece.color == 'white': self.pc_w[piece.z_idx] += 1
+        else:                      self.pc_b[piece.z_idx] += 1
         if type(piece) is King:
             if piece.color == 'white': self.white_king_pos = (r, c)
             else:                      self.black_king_pos = (r, c)
@@ -215,7 +218,8 @@ class Board:
         if not piece:
             return
         self._list_remove(piece)
-        self.piece_counts_z[piece.color][piece.z_idx] -= 1
+        if piece.color == 'white': self.pc_w[piece.z_idx] -= 1
+        else:                      self.pc_b[piece.z_idx] -= 1
         if type(piece) is King:
             if piece.color == 'white': self.white_king_pos = None
             else:                      self.black_king_pos = None
@@ -254,11 +258,9 @@ class Board:
         for p in white_pieces: r, c = p.pos; grid[r][c] = p
         for p in black_pieces: r, c = p.pos; grid[r][c] = p
 
-        pcz = self.piece_counts_z
-        new_board.piece_counts_z = {
-            'white': pcz['white'].copy(),
-            'black': pcz['black'].copy(),
-        }
+        new_board.pc_w = self.pc_w.copy()
+        new_board.pc_b = self.pc_b.copy()
+        new_board.piece_counts_z = {'white': new_board.pc_w, 'black': new_board.pc_b}
         return new_board
 
     def make_move(self, start, end, promo_cls=Queen):
@@ -276,9 +278,10 @@ class Board:
         old_ep       = self.ep_square
         old_halfmove = self.halfmove_clock
 
-        removed = []
-        added   = []
-        special = 0
+        removed_piece = None
+        removed_pos   = None
+        added_piece   = None
+        special       = 0
 
         if mp_z == 0 or target_piece is not None:
             self.halfmove_clock = 0
@@ -287,21 +290,22 @@ class Board:
 
         # En Passant capture
         if mp_z == 0 and (er, ec) == self.ep_square and target_piece is None and sc != ec:
-            ep_victim = self.grid[sr][ec]
-            if ep_victim is not None:
-                removed.append((ep_victim, sr, ec))
+            removed_piece = self.grid[sr][ec]
+            removed_pos   = (sr, ec)
+            if removed_piece is not None:
                 self.remove_piece(sr, ec)
             special = 2
         elif target_piece is not None:
-            removed.append((target_piece, er, ec))
+            removed_piece = target_piece
+            removed_pos   = (er, ec)
             self.remove_piece(er, ec)
 
         # Castling move
         if mp_z == 5 and abs(ec - sc) == 2:
             special = 1
-            if ec == 6: # Kingside
+            if ec == 6:
                 self.move_piece((sr, 7), (sr, 5))
-            elif ec == 2: # Queenside
+            elif ec == 2:
                 self.move_piece((sr, 0), (sr, 3))
 
         self.move_piece(start, end)
@@ -310,11 +314,9 @@ class Board:
         if mp_z == 0 and er == moving_piece.promo_rank:
             special = 3
             p_to_add = promo_cls if promo_cls is not None else Queen
-            removed.append((moving_piece, er, ec))
             self.remove_piece(er, ec)
-            promoted_piece = p_to_add(mc)
-            self.add_piece(promoted_piece, er, ec)
-            added.append((promoted_piece, er, ec))
+            added_piece = p_to_add(mc)
+            self.add_piece(added_piece, er, ec)
 
         # Update En Passant square
         if mp_z == 0 and abs(er - sr) == 2:
@@ -338,16 +340,16 @@ class Board:
             elif (er, ec) == (0, 7): self.castling_rights &= ~CASTLE_BK
             elif (er, ec) == (0, 0): self.castling_rights &= ~CASTLE_BQ
 
-        return (start, end, moving_piece, removed, added, old_castling, old_ep, old_halfmove, special, self.castling_rights, self.ep_square)
+        return (start, end, moving_piece, removed_piece, removed_pos, added_piece, old_castling, old_ep, old_halfmove, special, self.castling_rights, self.ep_square)
 
     def unmake_move(self, record_tuple):
-        start, end, moving_piece, removed, added, old_castling, old_ep, old_halfmove, special = record_tuple[:9]
+        start, end, moving_piece, removed_piece, removed_pos, added_piece, old_castling, old_ep, old_halfmove, special = record_tuple[:10]
         self.castling_rights = old_castling
         self.ep_square       = old_ep
         self.halfmove_clock  = old_halfmove
 
-        for p, r, c in added:
-            self.remove_piece(r, c)
+        if added_piece is not None:
+            self.remove_piece(end[0], end[1])
 
         if special == 3:
             self.add_piece(moving_piece, start[0], start[1])
@@ -361,9 +363,8 @@ class Board:
             elif end[1] == 2:
                 self.move_piece((sr, 3), (sr, 0))
 
-        for p, r, c in removed:
-            if p is not moving_piece:
-                self.add_piece(p, r, c)
+        if removed_piece is not None:
+            self.add_piece(removed_piece, removed_pos[0], removed_pos[1])
 
 
 # -----------------------------------------------------------------------
@@ -621,9 +622,9 @@ def _compute_check_and_pins(board, color):
     def _scan_rays(rays, slider_idxs):
         for ray in rays:
             blocker = None
-            seen = []
+            seen_mask = 0
             for cr, cc in ray:
-                seen.append((cr, cc))
+                seen_mask |= (1 << (cr * 8 + cc))
                 p = grid[cr][cc]
                 if p is None:
                     continue
@@ -637,10 +638,9 @@ def _compute_check_and_pins(board, color):
                         break
                 else:
                     if p.color == opp and p.z_idx in slider_idxs:
-                        pinned[(blocker[1], blocker[2])] = frozenset(seen)
+                        pinned[blocker[1] * 8 + blocker[2]] = seen_mask
                     break
 
-    # Execute ray scans at the function level (4 spaces indent)
     _scan_rays(RAYS_ORTHOGONAL[sq], (3, 4))  # Rook, Queen
     _scan_rays(RAYS_DIAGONAL[sq],   (2, 4))  # Bishop, Queen
 
@@ -710,8 +710,8 @@ def _generate_legal_moves(board, color, captures_only=False):
             if not is_ep_of_checker:
                 continue
 
-        pin_ray = pinned.get((sr, sc))
-        if pin_ray is not None and (tr, tc) not in pin_ray:
+        pin_mask = pinned.get(sr * 8 + sc)
+        if pin_mask is not None and not (pin_mask & (1 << (tr * 8 + tc))):
             continue
 
         if piece.z_idx == 0 and (tr, tc) == board.ep_square and sc != tc:

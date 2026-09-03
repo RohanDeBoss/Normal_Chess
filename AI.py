@@ -307,9 +307,15 @@ class ChessBot:
 
             # 1. Check Opening Book
             if self.use_opening_book and self.ply_count <= 16:
-                fen = board_to_fen(self.board, self.color)
-                if fen in OPENING_BOOK:
-                    book_options = OPENING_BOOK[fen]
+                full_fen = board_to_fen(self.board, self.color)
+                # Normalize to 4 fields (Placement, Turn, Castling, EP) to match standard books
+                fen_key = " ".join(full_fen.split()[:4])
+                
+                book_options = OPENING_BOOK.get(fen_key)
+                if book_options is None:
+                    book_options = OPENING_BOOK.get(full_fen)  # Fallback just in case
+                    
+                if book_options:
                     weights = [opt["weight"] for opt in book_options]
                     chosen = random.choices(book_options, weights=weights, k=1)[0]
                     move_tuple = (tuple(chosen["move"][0]), tuple(chosen["move"][1]), None)
@@ -866,17 +872,32 @@ class ChessBot:
         k2 = killers[1] if killers else None
 
         for move in moves:
-            (r1, c1), (r2, c2) = move[:2]
+            (r1, c1), (r2, c2) = move[0], move[1]
             moving_piece = grid[r1][c1]
             target_piece = grid[r2][c2]
 
-            swing, is_good_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+            # Fast inline MVV-LVA and tactic detection (Bypasses expensive SEE)
+            is_good_tactic = False
+            swing = 0
+            
+            is_pawn = (moving_piece.z_idx == 0)
+            promo_bonus = (ORDERING_VALUES[4] - ORDERING_VALUES[0]) if (is_pawn and r2 == moving_piece.promo_rank) else 0
+
+            if target_piece is not None:
+                swing = ORDERING_VALUES[target_piece.z_idx] * 10 - ORDERING_VALUES[moving_piece.z_idx] + promo_bonus
+                is_good_tactic = (ORDERING_VALUES[target_piece.z_idx] >= ORDERING_VALUES[moving_piece.z_idx]) or (promo_bonus > 0)
+            elif is_pawn and move[1] == board.ep_square:
+                swing = ORDERING_VALUES[0] * 10
+                is_good_tactic = True
+            elif promo_bonus > 0:
+                swing = promo_bonus
+                is_good_tactic = True
 
             if hash_move and move[0] == hash_move[0] and move[1] == hash_move[1]:
                 score = self.BONUS_PV_MOVE
             elif target_piece is not None or is_good_tactic:
                 if swing > 0:
-                    score = self.BONUS_CAPTURE + (swing * 100) - moving_piece.z_idx
+                    score = self.BONUS_CAPTURE + swing
                 elif swing == 0:
                     score = 6_000_000 - moving_piece.z_idx
                 else:

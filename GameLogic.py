@@ -850,22 +850,23 @@ def static_exchange_eval(board, move, moving_piece, target_piece):
         return _attackers_to_square(board, tr, tc, color, occupied_override)
 
     gains = [_SEE_VALUES[target_piece.z_idx]]
+    last_value = _SEE_VALUES[moving_piece.z_idx]
     side_to_move = moving_piece.opponent_color
-    current_attacker_value = _SEE_VALUES[moving_piece.z_idx]
 
     while True:
         attackers = attackers_live(side_to_move)
         if not attackers:
             break
         attackers.sort(key=lambda a: a[0])
-        value, fr, fc, fz = attackers[0]
+        value, fr, fc, _ = attackers[0]
 
-        gains.append(current_attacker_value - gains[-1])
+        gains.append(last_value)
 
         moving_p = occupied_override.get((fr, fc), grid[fr][fc])
         occupied_override[(fr, fc)] = None
         occupied_override[(tr, tc)] = moving_p
-        current_attacker_value = value
+
+        last_value = value
         side_to_move = 'black' if side_to_move == 'white' else 'white'
 
     result = gains[-1]

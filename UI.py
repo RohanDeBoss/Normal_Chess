@@ -32,9 +32,9 @@ class EnhancedChessApp:
     MAIN_AI_NAME     = "AI Bot"
     OPPONENT_AI_NAME = "OP Bot"
     ANALYSIS_AI_NAME = "Analysis"
-    slidermaxvalue   = 12
-    MAX_GAME_MOVES   = 200 # Kept for legacy compatibility, but logic allows None
-    AI_SERIES_GAMES  = 300
+    slidermaxvalue   = 15
+    MAX_GAME_MOVES   = None  # Standard chess rules: no artificial move limit
+    AI_SERIES_GAMES  = 500
 
     def __init__(self, master):
         self.master = master
@@ -1582,9 +1582,11 @@ class EnhancedChessApp:
         self.analysis_thinking = (bot_name == self.ANALYSIS_AI_NAME)
 
         if bot_class is ChessBot:
+            self.main_cancel_event.clear()
             self.active_worker_name = 'main'
             self.main_work_queue.put(task)
         else:
+            self.op_cancel_event.clear()
             self.active_worker_name = 'op'
             self.op_work_queue.put(task)
 

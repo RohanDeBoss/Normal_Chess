@@ -254,7 +254,9 @@ class EngineWorker:
         self.bot = None
 
     def handle_task(self, task, comm_queue, cancel_event):
-        cancel_event.clear()
+        if cancel_event.is_set():
+            return
+            
         wrapped_comm = TaskQueueWrapper(comm_queue, task.get("task_id", -1))
 
         values = {

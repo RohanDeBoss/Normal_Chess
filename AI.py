@@ -536,7 +536,9 @@ class ChessBot:
             if hash_val in search_path:
                 return self.DRAW_SCORE
 
-        if is_insufficient_material(board) or board.halfmove_clock >= 100:
+        if board.halfmove_clock >= 100:
+            return self.DRAW_SCORE
+        if total_pieces <= 8 and is_insufficient_material(board):
             return self.DRAW_SCORE
 
         original_alpha = alpha

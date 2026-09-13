@@ -1,4 +1,4 @@
-# Opponent AI.py (v1.91 - Working Baseline with win condition logic fix)
+# Opponent AI.py (v2.3 - Baseline)
 
 import time
 import random
@@ -52,11 +52,14 @@ ORDERING_VALUES = [
 INITIAL_PHASE_MATERIAL = (MG_PIECE_VALUES[Knight] * 4 + MG_PIECE_VALUES[Bishop] * 4 +
                           MG_PIECE_VALUES[Rook] * 4 + MG_PIECE_VALUES[Queen] * 2)
 
+MATE_SCORE = 1000000
+DRAW_SCORE = 0
+MATE_BOUND = 999000
+
 class OpponentAI:
     search_depth = 6
-    MATE_SCORE = 1000000
-    MATE_BOUND = 999000
-    DRAW_SCORE = 0
+    MATE_SCORE = MATE_SCORE
+    DRAW_SCORE = DRAW_SCORE
 
     MAX_Q_SEARCH_DEPTH = 12
     LMR_DEPTH_THRESHOLD = 3
@@ -304,9 +307,15 @@ class OpponentAI:
 
             # 1. Check Opening Book
             if self.use_opening_book and self.ply_count <= 16:
-                fen = board_to_fen(self.board, self.color)
-                if fen in OPENING_BOOK:
-                    book_options = OPENING_BOOK[fen]
+                full_fen = board_to_fen(self.board, self.color)
+                # Normalize to 4 fields (Placement, Turn, Castling, EP) to match standard books
+                fen_key = " ".join(full_fen.split()[:4])
+                
+                book_options = OPENING_BOOK.get(fen_key)
+                if book_options is None:
+                    book_options = OPENING_BOOK.get(full_fen)  # Fallback just in case
+                    
+                if book_options:
                     weights = [opt["weight"] for opt in book_options]
                     chosen = random.choices(book_options, weights=weights, k=1)[0]
                     move_tuple = (tuple(chosen["move"][0]), tuple(chosen["move"][1]), None)
@@ -524,7 +533,10 @@ class OpponentAI:
         if ply > 0:
             if self.position_counts.get(hash_val, 0) + (1 if hash_val in search_path else 0) >= 2:
                 return self.DRAW_SCORE
-        if is_insufficient_material(board) or board.halfmove_clock >= 100:
+
+        if board.halfmove_clock >= 100:
+            return self.DRAW_SCORE
+        if total_pieces <= 8 and is_insufficient_material(board):
             return self.DRAW_SCORE
 
         original_alpha = alpha
@@ -533,8 +545,8 @@ class OpponentAI:
 
         if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth:
             tt_score = self.tt_scores[tt_idx]
-            if tt_score >  self.MATE_BOUND: tt_score -= ply
-            elif tt_score < -self.MATE_BOUND: tt_score += ply
+            if tt_score > MATE_BOUND: tt_score -= ply
+            elif tt_score < -MATE_BOUND: tt_score += ply
 
             self.used_heuristic_eval = True
 
@@ -564,7 +576,7 @@ class OpponentAI:
 
         try:
             if (self.USE_REVERSE_FUTILITY_PRUNING and depth <= self.RFP_MAX_DEPTH and
-                    not is_in_check_flag and ply > 0 and abs(beta) < self.MATE_BOUND
+                    not is_in_check_flag and ply > 0 and abs(beta) < MATE_BOUND
                     and total_pieces > 6):
                 static_eval = self._peek_eval_tt(hash_val)
                 if static_eval is not None:
@@ -573,11 +585,11 @@ class OpponentAI:
                         return static_eval - rfp_margin
 
             if (self.USE_NULL_MOVE_PRUNING and depth >= self.NMP_MIN_DEPTH and
-                    ply > 0 and not is_in_check_flag and abs(beta) < self.MATE_BOUND
+                    ply > 0 and not is_in_check_flag and abs(beta) < MATE_BOUND
                     and total_pieces > 6):
-                pc = board.piece_counts_z
-                if (pc['white'][1] + pc['white'][2] + pc['white'][3] + pc['white'][4] > 0 and
-                        pc['black'][1] + pc['black'][2] + pc['black'][3] + pc['black'][4] > 0):
+                pc_w, pc_b = board.pc_w, board.pc_b
+                if (pc_w[1] + pc_w[2] + pc_w[3] + pc_w[4] > 0 and
+                        pc_b[1] + pc_b[2] + pc_b[3] + pc_b[4] > 0):
                     self.used_heuristic_eval = True
                     if static_eval is None:
                         static_eval = self._get_cached_static_eval(board, turn, hash_val)
@@ -596,11 +608,11 @@ class OpponentAI:
                         finally:
                             board.ep_square = saved_ep
                         if score >= beta: 
-                            return score if score < self.MATE_BOUND else beta
+                            return score if score < MATE_BOUND else beta
 
             futility_prune = False
             if (self.USE_FUTILITY_PRUNING and depth == 1 and not is_in_check_flag and
-                    abs(alpha) < self.MATE_BOUND and total_pieces > 6):
+                    abs(alpha) < MATE_BOUND and total_pieces > 6):
                 self.used_heuristic_eval = True
                 if static_eval is None:
                     static_eval = self._get_cached_static_eval(board, turn, hash_val)
@@ -650,10 +662,18 @@ class OpponentAI:
                         not is_in_check_flag and not is_good_tactic and not is_castling):
                     reduction = 1 + (depth // 6) + (legal_moves_count // 12)
 
-                    if (ply < len(self.killer_moves) and move[:2] in [k[:2] for k in self.killer_moves[ply] if k]) or (c_move and move[:2] == c_move[:2]):
+                    # Avoid list allocations in the hot loop
+                    is_killer = False
+                    if ply < len(self.killer_moves):
+                        k0, k1 = self.killer_moves[ply]
+                        is_killer = (k0 is not None and move[0] == k0[0] and move[1] == k0[1]) or \
+                                    (k1 is not None and move[0] == k1[0] and move[1] == k1[1])
+
+                    if is_killer or (c_move and move[0] == c_move[0] and move[1] == c_move[1]):
                         reduction -= 1
                         
-                    if history_table[f_sq][t_sq] > 200:
+                    # 10_000 correctly matches the 2,000,000 gravity table scale
+                    if history_table[f_sq][t_sq] > 10_000:
                         reduction -= 1
                         
                     reduction = max(0, min(reduction, depth - 2))
@@ -720,17 +740,17 @@ class OpponentAI:
                                         ch_table[ft] -= bonus + (ch_table[ft] * bonus) // 64_000
 
                     sto = best_score
-                    if sto >  self.MATE_BOUND: sto = best_score + ply
-                    elif sto < -self.MATE_BOUND: sto = best_score - ply
+                    if sto > MATE_BOUND: sto = best_score + ply
+                    elif sto < -MATE_BOUND: sto = best_score - ply
                     self._store_tt(hash_val, sto, depth, TT_FLAG_LOWERBOUND, move)
                     return best_score
 
             if legal_moves_count == 0:
-                return -self.MATE_SCORE + ply if is_in_check_flag else self.DRAW_SCORE
+                return -MATE_SCORE + ply if is_in_check_flag else DRAW_SCORE
 
             sto = best_score
-            if sto >  self.MATE_BOUND: sto = best_score + ply
-            elif sto < -self.MATE_BOUND: sto = best_score - ply
+            if sto > MATE_BOUND: sto = best_score + ply
+            elif sto < -MATE_BOUND: sto = best_score - ply
             flag = TT_FLAG_EXACT if best_score > original_alpha else TT_FLAG_UPPERBOUND
             self._store_tt(hash_val, sto, depth, flag, best_move_for_node)
             return best_score
@@ -751,8 +771,8 @@ class OpponentAI:
         tt_idx = self._tt_probe(hash_val)
         if tt_idx != -1:
             tt_score = self.tt_scores[tt_idx]
-            if tt_score > self.MATE_BOUND: tt_score -= ply
-            elif tt_score < -self.MATE_BOUND: tt_score += ply
+            if tt_score > MATE_BOUND: tt_score -= ply
+            elif tt_score < -MATE_BOUND: tt_score += ply
             tt_flag = self.tt_flags[tt_idx]
             if tt_flag == TT_FLAG_EXACT: return tt_score
             if tt_flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
@@ -780,7 +800,7 @@ class OpponentAI:
                 target_piece = grid[r2][c2]
                 swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
                 score = swing * 10 - moving_piece.z_idx
-                if tt_move and move[:2] == tt_move[:2]: score += 1_000_000
+                if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
                 scored_moves.append((score, move))
             scored_moves.sort(key=itemgetter(0), reverse=True)
 
@@ -821,7 +841,7 @@ class OpponentAI:
             if stand_pat + swing + 200 < alpha: continue
 
             score = swing * 10 - moving_piece.z_idx
-            if tt_move and move[:2] == tt_move[:2]: score += 1_000_000
+            if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
             scored_moves.append((score, move))
 
         scored_moves.sort(key=itemgetter(0), reverse=True)
@@ -852,26 +872,41 @@ class OpponentAI:
         k2 = killers[1] if killers else None
 
         for move in moves:
-            (r1, c1), (r2, c2) = move[:2]
+            (r1, c1), (r2, c2) = move[0], move[1]
             moving_piece = grid[r1][c1]
             target_piece = grid[r2][c2]
 
-            swing, is_good_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+            # Fast inline MVV-LVA and tactic detection (Bypasses expensive SEE)
+            is_good_tactic = False
+            swing = 0
+            
+            is_pawn = (moving_piece.z_idx == 0)
+            promo_bonus = (ORDERING_VALUES[4] - ORDERING_VALUES[0]) if (is_pawn and r2 == moving_piece.promo_rank) else 0
 
-            if hash_move and move[:2] == hash_move[:2]:
+            if target_piece is not None:
+                swing = ORDERING_VALUES[target_piece.z_idx] * 10 - ORDERING_VALUES[moving_piece.z_idx] + promo_bonus
+                is_good_tactic = (ORDERING_VALUES[target_piece.z_idx] >= ORDERING_VALUES[moving_piece.z_idx]) or (promo_bonus > 0)
+            elif is_pawn and move[1] == board.ep_square:
+                swing = ORDERING_VALUES[0] * 10
+                is_good_tactic = True
+            elif promo_bonus > 0:
+                swing = promo_bonus
+                is_good_tactic = True
+
+            if hash_move and move[0] == hash_move[0] and move[1] == hash_move[1]:
                 score = self.BONUS_PV_MOVE
             elif target_piece is not None or is_good_tactic:
                 if swing > 0:
-                    score = self.BONUS_CAPTURE + (swing * 100) - moving_piece.z_idx
+                    score = self.BONUS_CAPTURE + swing
                 elif swing == 0:
                     score = 6_000_000 - moving_piece.z_idx
                 else:
                     score = -1_000_000 + swing  # Bad capture: rank below quiet moves
-            elif k1 and move[:2] == k1[:2]:
+            elif k1 and move[0] == k1[0] and move[1] == k1[1]:
                 score = self.BONUS_KILLER_1
-            elif k2 and move[:2] == k2[:2]:
+            elif k2 and move[0] == k2[0] and move[1] == k2[1]:
                 score = self.BONUS_KILLER_2
-            elif counter_move and move[:2] == counter_move[:2]:
+            elif counter_move and move[0] == counter_move[0] and move[1] == counter_move[1]:
                 score = 2_000_000
             else:
                 score = history_table[r1 * 8 + c1][r2 * 8 + c2]
@@ -912,10 +947,18 @@ class OpponentAI:
 
         w_pawn_files = [0] * 8
         b_pawn_files = [0] * 8
+        w_max_pawn_r = [-1] * 8
+        b_min_pawn_r = [8] * 8
         for p in board.white_pieces:
-            if p.z_idx == 0: w_pawn_files[p.pos[1]] += 1
+            if p.z_idx == 0:
+                pr, pc = p.pos
+                w_pawn_files[pc] += 1
+                if pr > w_max_pawn_r[pc]: w_max_pawn_r[pc] = pr
         for p in board.black_pieces:
-            if p.z_idx == 0: b_pawn_files[p.pos[1]] += 1
+            if p.z_idx == 0:
+                pr, pc = p.pos
+                b_pawn_files[pc] += 1
+                if pr < b_min_pawn_r[pc]: b_min_pawn_r[pc] = pr
 
         for color_idx in (0, 1):
             pieces   = piece_lists[color_idx]
@@ -939,16 +982,19 @@ class OpponentAI:
                 if z == 0:
                     advancement = (7 - r) if is_white else r
 
-                    # Passed pawn
+                    # Fast O(1) Passed pawn check
                     is_passed = True
-                    for fc in range(max(0, c - 1), min(8, c + 2)):
-                        opp_pieces = board.black_pieces if is_white else board.white_pieces
-                        for opp_p in opp_pieces:
-                            if opp_p.z_idx == 0 and opp_p.pos[1] == fc:
-                                if (is_white and opp_p.pos[0] < r) or (not is_white and opp_p.pos[0] > r):
-                                    is_passed = False
-                                    break
-                        if not is_passed: break
+                    if is_white:
+                        for fc in range(max(0, c - 1), min(8, c + 2)):
+                            if b_min_pawn_r[fc] < r:
+                                is_passed = False
+                                break
+                    else:
+                        for fc in range(max(0, c - 1), min(8, c + 2)):
+                            if w_max_pawn_r[fc] > r:
+                                is_passed = False
+                                break
+
                     if is_passed and advancement < len(self.EVAL_PASSED_PAWN_RANK):
                         scores_eg[color_idx] += self.EVAL_PASSED_PAWN_RANK[advancement]
 

@@ -1,4 +1,4 @@
-# AI.py (v2.52 - Bug fixes + speed + pure search)
+# AI.py (v2.6 - Still pure; added Futility Reduction)
 
 import time
 import random
@@ -70,8 +70,8 @@ class ChessBot:
     NMP_DEPTH_DIVISOR = 6
     USE_NULL_MOVE_PRUNING = False
 
-    USE_FUTILITY_PRUNING = False
-    FUTILITY_MARGIN = 350
+    USE_FUTILITY_REDUCTION = True
+    FUTILITY_MARGIN_PER_DEPTH = 150
 
     USE_REVERSE_FUTILITY_PRUNING = False
     RFP_MAX_DEPTH = 2
@@ -628,14 +628,14 @@ class ChessBot:
                         if score >= beta: 
                             return score if score < MATE_BOUND else beta
 
-            futility_prune = False
-            if (self.USE_FUTILITY_PRUNING and depth == 1 and not is_in_check_flag and
+            futility_reduction_active = False
+            if (self.USE_FUTILITY_REDUCTION and depth <= 3 and not is_in_check_flag and
                     abs(alpha) < MATE_BOUND and total_pieces > 6):
                 self.used_heuristic_eval = True
                 if static_eval is None:
                     static_eval = self._get_cached_static_eval(board, turn, hash_val)
-                if static_eval + self.FUTILITY_MARGIN < alpha:
-                    futility_prune = True
+                if static_eval + self.FUTILITY_MARGIN_PER_DEPTH * depth < alpha:
+                    futility_reduction_active = True
 
             legal_moves = get_all_legal_moves(board, turn)
 
@@ -668,13 +668,10 @@ class ChessBot:
                 legal_moves_count += 1
                 if not is_good_tactic: quiet_moves_tried.append((move, moving_piece))
 
-                if futility_prune and not is_good_tactic and legal_moves_count > 1:
-                    if not is_in_check(board, opponent_turn):
-                        board.unmake_move(record)
-                        continue
-
                 reduction = 0
                 is_castling = (moving_piece.z_idx == 5 and abs(move[1][1] - move[0][1]) == 2)
+
+                # 1. Standard Late Move Reduction
                 if (self.USE_LMR and depth >= self.LMR_DEPTH_THRESHOLD and
                         legal_moves_count > self.LMR_MOVE_COUNT_THRESHOLD and
                         not is_in_check_flag and not is_good_tactic and not is_castling):
@@ -693,8 +690,13 @@ class ChessBot:
                     # 10_000 correctly matches the 2,000,000 gravity table scale
                     if history_table[f_sq][t_sq] > 10_000:
                         reduction -= 1
-                        
-                    reduction = max(0, min(reduction, depth - 2))
+
+                # 2. Futility Reduction: Softly reduce quiet moves when position is far below alpha
+                # (Safe for variants: never discards the move, triggers PVS re-search if score > alpha)
+                if futility_reduction_active and not is_good_tactic and not is_castling and legal_moves_count > 1:
+                    reduction += 1
+
+                reduction = max(0, min(reduction, depth - 1))
 
                 search_depth_child = depth - 1 - reduction
                 next_prev_tuple = (move, moving_piece.z_idx)

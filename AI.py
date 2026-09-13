@@ -1,4 +1,4 @@
-# AI.py (v2.3 - Lots of stuff to speed things up idk)
+# AI.py (v2.4 - Repetition can be seen coming)
 
 import time
 import random
@@ -543,13 +543,13 @@ class ChessBot:
         tt_idx = self._tt_probe(hash_val)
         hash_move = self.tt_moves[tt_idx] if tt_idx != -1 else None
 
-        if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth:
+        repetition_adjacent = self.position_counts.get(hash_val, 0) >= 1 or hash_val in search_path
+        if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth and not repetition_adjacent:
             tt_score = self.tt_scores[tt_idx]
             if tt_score > MATE_BOUND: tt_score -= ply
             elif tt_score < -MATE_BOUND: tt_score += ply
 
             self.used_heuristic_eval = True
-
             tt_flag = self.tt_flags[tt_idx]
             if tt_flag == TT_FLAG_EXACT:
                 return tt_score
@@ -559,7 +559,7 @@ class ChessBot:
                 if tt_score < beta: beta = tt_score
             if alpha >= beta: return tt_score
 
-        if depth <= 0: return self.qsearch(board, alpha, beta, turn, ply, current_hash=hash_val)
+        if depth <= 0: return self.qsearch(board, alpha, beta, turn, ply, search_path, current_hash=hash_val)
 
         opponent_turn    = 'black' if turn == 'white' else 'white'
         is_in_check_flag = is_in_check(board, turn)
@@ -758,18 +758,19 @@ class ChessBot:
         finally:
             if path_added: search_path.discard(hash_val)
 
-    def qsearch(self, board, alpha, beta, turn, ply, current_hash=None):
+    def qsearch(self, board, alpha, beta, turn, ply, search_path, current_hash=None):
         self.nodes_searched += 1
         if (self.nodes_searched & self.time_check_mask) == 0:
             if self.cancellation_event.is_set() or (self.stop_time and time.time() > self.stop_time):
                 raise SearchCancelledException()
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
-        if ply > 0 and self.position_counts.get(hash_val, 0) >= 2:
+        if ply > 0 and self.position_counts.get(hash_val, 0) + (1 if hash_val in search_path else 0) >= 2:
             return self.DRAW_SCORE
 
+        repetition_adjacent = self.position_counts.get(hash_val, 0) >= 1 or hash_val in search_path
         tt_idx = self._tt_probe(hash_val)
-        if tt_idx != -1:
+        if tt_idx != -1 and not repetition_adjacent:
             tt_score = self.tt_scores[tt_idx]
             if tt_score > MATE_BOUND: tt_score -= ply
             elif tt_score < -MATE_BOUND: tt_score += ply
@@ -791,26 +792,72 @@ class ChessBot:
         tt_move = self.tt_moves[tt_idx] if tt_idx != -1 else None
         grid = board.grid
 
-        if is_in_check_flag:
-            candidate_moves = get_all_legal_moves(board, turn)
+        path_added = False
+        if hash_val not in search_path:
+            search_path.add(hash_val)
+            path_added = True
+
+        try:
+            if is_in_check_flag:
+                candidate_moves = get_all_legal_moves(board, turn)
+                scored_moves = []
+                for move in candidate_moves:
+                    (r1, c1), (r2, c2) = move[:2]
+                    moving_piece = grid[r1][c1]
+                    target_piece = grid[r2][c2]
+                    swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+                    score = swing * 10 - moving_piece.z_idx
+                    if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
+                    scored_moves.append((score, move))
+                scored_moves.sort(key=itemgetter(0), reverse=True)
+
+                legal_moves_count = 0
+                for score, move in scored_moves:
+                    promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+                    record = board.make_move_track(move[0], move[1], promo)
+                    legal_moves_count += 1
+                    child_hash = incremental_hash(hash_val, record)
+                    search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash)
+                    board.unmake_move(record)
+
+                    if search_score > best_score:
+                        best_score = search_score
+                        if search_score > alpha: alpha = search_score
+                    if best_score >= beta: return best_score
+
+                if legal_moves_count == 0:
+                    return -self.MATE_SCORE + ply
+                return best_score
+
+            # Not in check: Generate ONLY captures and tactical promotions (2x speedup!)
+            stand_pat = self._get_cached_static_eval(board, turn, hash_val)
+            best_score = stand_pat
+            if stand_pat >= beta: return stand_pat
+            if stand_pat > alpha: alpha = stand_pat
+
+            promising_moves = get_all_legal_captures(board, turn)
             scored_moves = []
-            for move in candidate_moves:
+
+            for move in promising_moves:
                 (r1, c1), (r2, c2) = move[:2]
                 moving_piece = grid[r1][c1]
                 target_piece = grid[r2][c2]
-                swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+
+                swing, is_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+                if not is_tactic: continue
+                if stand_pat + swing + 200 < alpha: continue
+
                 score = swing * 10 - moving_piece.z_idx
                 if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
                 scored_moves.append((score, move))
+
             scored_moves.sort(key=itemgetter(0), reverse=True)
 
-            legal_moves_count = 0
             for score, move in scored_moves:
                 promo = move[2] if len(move) > 2 and move[2] is not None else Queen
                 record = board.make_move_track(move[0], move[1], promo)
-                legal_moves_count += 1
                 child_hash = incremental_hash(hash_val, record)
-                search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
+                search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash)
                 board.unmake_move(record)
 
                 if search_score > best_score:
@@ -818,47 +865,9 @@ class ChessBot:
                     if search_score > alpha: alpha = search_score
                 if best_score >= beta: return best_score
 
-            if legal_moves_count == 0:
-                return -self.MATE_SCORE + ply
             return best_score
-
-        # Not in check: Generate ONLY captures and tactical promotions (2x speedup!)
-        stand_pat = self._get_cached_static_eval(board, turn, hash_val)
-        best_score = stand_pat
-        if stand_pat >= beta: return stand_pat
-        if stand_pat > alpha: alpha = stand_pat
-
-        promising_moves = get_all_legal_captures(board, turn)
-        scored_moves = []
-
-        for move in promising_moves:
-            (r1, c1), (r2, c2) = move[:2]
-            moving_piece = grid[r1][c1]
-            target_piece = grid[r2][c2]
-
-            swing, is_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
-            if not is_tactic: continue
-            if stand_pat + swing + 200 < alpha: continue
-
-            score = swing * 10 - moving_piece.z_idx
-            if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
-            scored_moves.append((score, move))
-
-        scored_moves.sort(key=itemgetter(0), reverse=True)
-
-        for score, move in scored_moves:
-            promo = move[2] if len(move) > 2 and move[2] is not None else Queen
-            record = board.make_move_track(move[0], move[1], promo)
-            child_hash = incremental_hash(hash_val, record)
-            search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
-            board.unmake_move(record)
-
-            if search_score > best_score:
-                best_score = search_score
-                if search_score > alpha: alpha = search_score
-            if best_score >= beta: return best_score
-
-        return best_score
+        finally:
+            if path_added: search_path.discard(hash_val)
 
     def order_moves(self, board, moves, ply, hash_move, turn, return_meta=False, counter_move=None, prev_move_tuple=None):
         if not moves: return []

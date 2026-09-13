@@ -531,9 +531,7 @@ class ChessBot:
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
         if ply > 0:
-            if self.position_counts.get(hash_val, 0) >= 2:
-                return self.DRAW_SCORE
-            if hash_val in search_path:
+            if self.position_counts.get(hash_val, 0) + (1 if hash_val in search_path else 0) >= 2:
                 return self.DRAW_SCORE
 
         if board.halfmove_clock >= 100:

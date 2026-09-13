@@ -522,11 +522,8 @@ class OpponentAI:
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
         if ply > 0:
-            if self.position_counts.get(hash_val, 0) >= 2:
+            if self.position_counts.get(hash_val, 0) + (1 if hash_val in search_path else 0) >= 2:
                 return self.DRAW_SCORE
-            if hash_val in search_path:
-                return self.DRAW_SCORE
-
         if is_insufficient_material(board) or board.halfmove_clock >= 100:
             return self.DRAW_SCORE
 

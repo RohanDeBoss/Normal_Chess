@@ -1,4 +1,4 @@
-# AI.py (v2.6 - Still pure; added Futility Reduction)
+# AI.py (v2.71 - Still 99% pure; safe NMP)
 
 import time
 import random
@@ -68,7 +68,7 @@ class ChessBot:
     NMP_MIN_DEPTH = 3
     NMP_BASE_REDUCTION = 2
     NMP_DEPTH_DIVISOR = 6
-    USE_NULL_MOVE_PRUNING = False
+    USE_NULL_MOVE_PRUNING = True    # Re-enabled with strict Zugzwang protection
 
     USE_FUTILITY_REDUCTION = True
     FUTILITY_MARGIN_PER_DEPTH = 150
@@ -605,9 +605,13 @@ class ChessBot:
             if (self.USE_NULL_MOVE_PRUNING and depth >= self.NMP_MIN_DEPTH and
                     ply > 0 and not is_in_check_flag and abs(beta) < MATE_BOUND
                     and total_pieces > 6):
-                pc_w, pc_b = board.pc_w, board.pc_b
-                if (pc_w[1] + pc_w[2] + pc_w[3] + pc_w[4] > 0 and
-                        pc_b[1] + pc_b[2] + pc_b[3] + pc_b[4] > 0):
+                my_pc = board.pc_w if turn == 'white' else board.pc_b
+                # Zugzwang-Safe Guard: Side to move must hold at least 1 major piece (R/Q)
+                # or at least 2 minor pieces (N/B). In pawn or 1-minor endgames, NMP is strictly disabled.
+                has_major = (my_pc[3] + my_pc[4] > 0)
+                has_two_minors = (my_pc[1] + my_pc[2] >= 2)
+
+                if has_major or has_two_minors:
                     self.used_heuristic_eval = True
                     if static_eval is None:
                         static_eval = self._get_cached_static_eval(board, turn, hash_val)

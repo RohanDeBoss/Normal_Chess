@@ -1,4 +1,4 @@
-# Opponent AI.py (v1.9 - Ultra High Performance: Lean Eval, SEE Move Ordering, Capture-Only QSearch)
+# Opponent AI.py (v1.91 - Working Baseline with win condition logic fix)
 
 import time
 import random
@@ -55,6 +55,7 @@ INITIAL_PHASE_MATERIAL = (MG_PIECE_VALUES[Knight] * 4 + MG_PIECE_VALUES[Bishop] 
 class OpponentAI:
     search_depth = 6
     MATE_SCORE = 1000000
+    MATE_BOUND = 999000
     DRAW_SCORE = 0
 
     MAX_Q_SEARCH_DEPTH = 12
@@ -521,7 +522,7 @@ class OpponentAI:
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
         if ply > 0:
-            if hash_val in self.position_counts:
+            if self.position_counts.get(hash_val, 0) >= 2:
                 return self.DRAW_SCORE
             if hash_val in search_path:
                 return self.DRAW_SCORE
@@ -535,8 +536,8 @@ class OpponentAI:
 
         if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth:
             tt_score = self.tt_scores[tt_idx]
-            if tt_score >  self.MATE_SCORE - 1000: tt_score -= ply
-            elif tt_score < -self.MATE_SCORE + 1000: tt_score += ply
+            if tt_score >  self.MATE_BOUND: tt_score -= ply
+            elif tt_score < -self.MATE_BOUND: tt_score += ply
 
             self.used_heuristic_eval = True
 
@@ -566,7 +567,7 @@ class OpponentAI:
 
         try:
             if (self.USE_REVERSE_FUTILITY_PRUNING and depth <= self.RFP_MAX_DEPTH and
-                    not is_in_check_flag and ply > 0 and abs(beta) < self.MATE_SCORE - 1000
+                    not is_in_check_flag and ply > 0 and abs(beta) < self.MATE_BOUND
                     and total_pieces > 6):
                 static_eval = self._peek_eval_tt(hash_val)
                 if static_eval is not None:
@@ -575,7 +576,7 @@ class OpponentAI:
                         return static_eval - rfp_margin
 
             if (self.USE_NULL_MOVE_PRUNING and depth >= self.NMP_MIN_DEPTH and
-                    ply > 0 and not is_in_check_flag and abs(beta) < self.MATE_SCORE - 1000
+                    ply > 0 and not is_in_check_flag and abs(beta) < self.MATE_BOUND
                     and total_pieces > 6):
                 pc = board.piece_counts_z
                 if (pc['white'][1] + pc['white'][2] + pc['white'][3] + pc['white'][4] > 0 and
@@ -598,11 +599,11 @@ class OpponentAI:
                         finally:
                             board.ep_square = saved_ep
                         if score >= beta: 
-                            return score if score < self.MATE_SCORE - 1000 else beta
+                            return score if score < self.MATE_BOUND else beta
 
             futility_prune = False
             if (self.USE_FUTILITY_PRUNING and depth == 1 and not is_in_check_flag and
-                    abs(alpha) < self.MATE_SCORE - 1000 and total_pieces > 6):
+                    abs(alpha) < self.MATE_BOUND and total_pieces > 6):
                 self.used_heuristic_eval = True
                 if static_eval is None:
                     static_eval = self._get_cached_static_eval(board, turn, hash_val)
@@ -722,17 +723,17 @@ class OpponentAI:
                                         ch_table[ft] -= bonus + (ch_table[ft] * bonus) // 64_000
 
                     sto = best_score
-                    if sto >  self.MATE_SCORE - 1000: sto = best_score + ply
-                    elif sto < -self.MATE_SCORE + 1000: sto = best_score - ply
+                    if sto >  self.MATE_BOUND: sto = best_score + ply
+                    elif sto < -self.MATE_BOUND: sto = best_score - ply
                     self._store_tt(hash_val, sto, depth, TT_FLAG_LOWERBOUND, move)
                     return best_score
 
             if legal_moves_count == 0:
-                return -self.MATE_SCORE + ply
+                return -self.MATE_SCORE + ply if is_in_check_flag else self.DRAW_SCORE
 
             sto = best_score
-            if sto >  self.MATE_SCORE - 1000: sto = best_score + ply
-            elif sto < -self.MATE_SCORE + 1000: sto = best_score - ply
+            if sto >  self.MATE_BOUND: sto = best_score + ply
+            elif sto < -self.MATE_BOUND: sto = best_score - ply
             flag = TT_FLAG_EXACT if best_score > original_alpha else TT_FLAG_UPPERBOUND
             self._store_tt(hash_val, sto, depth, flag, best_move_for_node)
             return best_score
@@ -747,14 +748,14 @@ class OpponentAI:
                 raise SearchCancelledException()
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
-        if ply > 0 and hash_val in self.position_counts:
+        if ply > 0 and self.position_counts.get(hash_val, 0) >= 2:
             return self.DRAW_SCORE
 
         tt_idx = self._tt_probe(hash_val)
         if tt_idx != -1:
             tt_score = self.tt_scores[tt_idx]
-            if tt_score > self.MATE_SCORE - 1000: tt_score -= ply
-            elif tt_score < -self.MATE_SCORE + 1000: tt_score += ply
+            if tt_score > self.MATE_BOUND: tt_score -= ply
+            elif tt_score < -self.MATE_BOUND: tt_score += ply
             tt_flag = self.tt_flags[tt_idx]
             if tt_flag == TT_FLAG_EXACT: return tt_score
             if tt_flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score

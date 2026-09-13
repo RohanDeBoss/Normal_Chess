@@ -1,4 +1,4 @@
-# EngineRuntime.py (v1.9 - Lots of stuff to speed things up idk)
+# EngineRuntime.py (v1.91 - Cleanup)
 
 import glob
 import inspect
@@ -8,7 +8,6 @@ import os
 import random
 import re
 import traceback
-from collections import namedtuple
 
 from GameLogic import (
     ROWS, COLS, Pawn, Knight, Bishop, Rook, Queen, King, Board,
@@ -412,7 +411,6 @@ def write_series_stats_file(out_path, move_stats, series_stats, main_name, op_na
     except Exception as e:
         print(f"Failed to save stats: {e}")
 
-TTEntry = namedtuple('TTEntry', ['score', 'depth', 'flag', 'best_move', 'age'])
 TT_FLAG_EXACT, TT_FLAG_LOWERBOUND, TT_FLAG_UPPERBOUND = 0, 1, 2
 
 def format_bot_move(bot, board_before, move):

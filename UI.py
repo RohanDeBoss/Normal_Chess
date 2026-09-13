@@ -1,4 +1,4 @@
-# ChessUI.py (v2.11 Fixes from wave 2)
+# ChessUI.py (v2.12 Console cleanup)
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -1209,7 +1209,7 @@ class EnhancedChessApp:
     def clear_hash_manually(self):
         self._force_clear_hash = True
         self._stop_ai_process(invalidate_task=True)
-        print("--- Transposition Table & History Cleared ---")
+        print("\n--- Transposition Table & History Cleared ---")
         if self.analysis_mode_var.get() and self.game_mode.get() == GameMode.HUMAN_VS_HUMAN.value:
             self._update_analysis_after_state_change()
 

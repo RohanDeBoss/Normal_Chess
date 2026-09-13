@@ -1,9 +1,6 @@
-# GameLogic.py (v1.6 - Lots of stuff to speed things up idk)
+# GameLogic.py (v1.61 - Delete unused variables)
 
 ROWS, COLS = 8, 8
-SQUARE_SIZE = 75
-BOARD_COLOR_1 = "#D2B48C"
-BOARD_COLOR_2 = "#8B5A2B"
 OPPONENT_COLOR = {'white': 'black', 'black': 'white'}
 
 DIRECTIONS = {

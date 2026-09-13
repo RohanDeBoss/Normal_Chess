@@ -1,4 +1,4 @@
-# AI.py (v2.4 - Repetition can be seen coming)
+# AI.py (v2.52 - Bug fixes + speed + pure search)
 
 import time
 import random
@@ -62,26 +62,27 @@ class ChessBot:
     DRAW_SCORE = DRAW_SCORE
 
     MAX_Q_SEARCH_DEPTH = 12
+    USE_LMR = True
     LMR_DEPTH_THRESHOLD = 3
     LMR_MOVE_COUNT_THRESHOLD = 4
     NMP_MIN_DEPTH = 3
     NMP_BASE_REDUCTION = 2
     NMP_DEPTH_DIVISOR = 6
-    USE_NULL_MOVE_PRUNING = True
+    USE_NULL_MOVE_PRUNING = False
 
-    USE_FUTILITY_PRUNING = True
+    USE_FUTILITY_PRUNING = False
     FUTILITY_MARGIN = 350
 
-    USE_REVERSE_FUTILITY_PRUNING = True
+    USE_REVERSE_FUTILITY_PRUNING = False
     RFP_MAX_DEPTH = 2
     RFP_MARGIN_PER_DEPTH = 150
 
     USE_IIR = True
     IIR_MIN_DEPTH = 4
 
-    TT_SIZE      = 1 << 22   # ~4.19M slots
+    TT_SIZE      = 1 << 20
     TT_MASK      = TT_SIZE - 1
-    EVAL_TT_SIZE = 1 << 21   # ~2.10M slots
+    EVAL_TT_SIZE = 1 << 19
     EVAL_TT_MASK = EVAL_TT_SIZE - 1
 
     BONUS_PV_MOVE = 10_000_000
@@ -201,7 +202,22 @@ class ChessBot:
         stored_depth = self.tt_depths[idx]
         same_position = (stored_depth != -1 and self.tt_keys[idx] == hash_val)
 
-        if stored_depth == -1 or self.tt_ages[idx] < self.current_age or depth >= stored_depth:
+        # Replacement Strategy:
+        # 1. Same position: NEVER replace a deeper search with a shallower one.
+        # 2. Hash collision: Only evict if empty, deeper, 3+ turns old,
+        #    or depth exceeds age-decayed priority (2 plies per turn).
+        if same_position:
+            replace = (depth >= stored_depth)
+        else:
+            age_diff = self.current_age - self.tt_ages[idx]
+            replace = (
+                stored_depth == -1
+                or depth >= stored_depth
+                or age_diff >= 3
+                or depth >= (stored_depth - age_diff * 2)
+            )
+
+        if replace:
             if stored_depth == -1:
                 self.tt_filled += 1
             self.tt_keys[idx]   = hash_val
@@ -530,8 +546,10 @@ class ChessBot:
         total_pieces = len(board.white_pieces) + len(board.black_pieces)
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
+        game_count = self.position_counts.get(hash_val, 0)
         if ply > 0:
-            if self.position_counts.get(hash_val, 0) + (1 if hash_val in search_path else 0) >= 2:
+            # Immediate cycle on current search branch, or 3rd occurrence of a game position
+            if hash_val in search_path or game_count >= 2:
                 return self.DRAW_SCORE
 
         if board.halfmove_clock >= 100:
@@ -543,8 +561,8 @@ class ChessBot:
         tt_idx = self._tt_probe(hash_val)
         hash_move = self.tt_moves[tt_idx] if tt_idx != -1 else None
 
-        repetition_adjacent = self.position_counts.get(hash_val, 0) >= 1 or hash_val in search_path
-        if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth and not repetition_adjacent:
+        # Only take score cutoffs if position has not occurred in the game history (GHI safeguard)
+        if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth and game_count == 0:
             tt_score = self.tt_scores[tt_idx]
             if tt_score > MATE_BOUND: tt_score -= ply
             elif tt_score < -MATE_BOUND: tt_score += ply
@@ -657,7 +675,7 @@ class ChessBot:
 
                 reduction = 0
                 is_castling = (moving_piece.z_idx == 5 and abs(move[1][1] - move[0][1]) == 2)
-                if (depth >= self.LMR_DEPTH_THRESHOLD and
+                if (self.USE_LMR and depth >= self.LMR_DEPTH_THRESHOLD and
                         legal_moves_count > self.LMR_MOVE_COUNT_THRESHOLD and
                         not is_in_check_flag and not is_good_tactic and not is_castling):
                     reduction = 1 + (depth // 6) + (legal_moves_count // 12)
@@ -765,15 +783,16 @@ class ChessBot:
                 raise SearchCancelledException()
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
-        if ply > 0 and self.position_counts.get(hash_val, 0) + (1 if hash_val in search_path else 0) >= 2:
+        game_count = self.position_counts.get(hash_val, 0)
+        if ply > 0 and (hash_val in search_path or game_count >= 2):
             return self.DRAW_SCORE
 
-        repetition_adjacent = self.position_counts.get(hash_val, 0) >= 1 or hash_val in search_path
         tt_idx = self._tt_probe(hash_val)
-        if tt_idx != -1 and not repetition_adjacent:
+        if tt_idx != -1 and game_count == 0:
             tt_score = self.tt_scores[tt_idx]
             if tt_score > MATE_BOUND: tt_score -= ply
             elif tt_score < -MATE_BOUND: tt_score += ply
+
             tt_flag = self.tt_flags[tt_idx]
             if tt_flag == TT_FLAG_EXACT: return tt_score
             if tt_flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
@@ -792,13 +811,14 @@ class ChessBot:
         tt_move = self.tt_moves[tt_idx] if tt_idx != -1 else None
         grid = board.grid
 
-        path_added = False
-        if hash_val not in search_path:
-            search_path.add(hash_val)
-            path_added = True
-
-        try:
-            if is_in_check_flag:
+        # 1. IN CHECK: Evasions include quiet moves which CAN repeat.
+        # Track search_path here to stop perpetual checks.
+        if is_in_check_flag:
+            path_added = False
+            if hash_val not in search_path:
+                search_path.add(hash_val)
+                path_added = True
+            try:
                 candidate_moves = get_all_legal_moves(board, turn)
                 scored_moves = []
                 for move in candidate_moves:
@@ -807,7 +827,7 @@ class ChessBot:
                     target_piece = grid[r2][c2]
                     swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
                     score = swing * 10 - moving_piece.z_idx
-                    if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
+                    if tt_move and move[:2] == tt_move[:2]: score += 1_000_000
                     scored_moves.append((score, move))
                 scored_moves.sort(key=itemgetter(0), reverse=True)
 
@@ -828,46 +848,45 @@ class ChessBot:
                 if legal_moves_count == 0:
                     return -self.MATE_SCORE + ply
                 return best_score
+            finally:
+                if path_added: search_path.discard(hash_val)
 
-            # Not in check: Generate ONLY captures and tactical promotions (2x speedup!)
-            stand_pat = self._get_cached_static_eval(board, turn, hash_val)
-            best_score = stand_pat
-            if stand_pat >= beta: return stand_pat
-            if stand_pat > alpha: alpha = stand_pat
+        # 2. NOT IN CHECK: Captures & promotions are irreversible.
+        # Cycles are impossible, so we omit search_path.add/discard for max speed.
+        stand_pat = self._get_cached_static_eval(board, turn, hash_val)
+        best_score = stand_pat
+        if stand_pat >= beta: return stand_pat
+        if stand_pat > alpha: alpha = stand_pat
 
-            promising_moves = get_all_legal_captures(board, turn)
-            scored_moves = []
+        promising_moves = get_all_legal_captures(board, turn)
+        scored_moves = []
 
-            for move in promising_moves:
-                (r1, c1), (r2, c2) = move[:2]
-                moving_piece = grid[r1][c1]
-                target_piece = grid[r2][c2]
+        for move in promising_moves:
+            (r1, c1), (r2, c2) = move[:2]
+            moving_piece = grid[r1][c1]
+            target_piece = grid[r2][c2]
 
-                swing, is_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
-                if not is_tactic: continue
-                if stand_pat + swing + 200 < alpha: continue
+            swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
 
-                score = swing * 10 - moving_piece.z_idx
-                if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
-                scored_moves.append((score, move))
+            score = swing * 10 - moving_piece.z_idx
+            if tt_move and move[:2] == tt_move[:2]: score += 1_000_000
+            scored_moves.append((score, move))
 
-            scored_moves.sort(key=itemgetter(0), reverse=True)
+        scored_moves.sort(key=itemgetter(0), reverse=True)
 
-            for score, move in scored_moves:
-                promo = move[2] if len(move) > 2 and move[2] is not None else Queen
-                record = board.make_move_track(move[0], move[1], promo)
-                child_hash = incremental_hash(hash_val, record)
-                search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash)
-                board.unmake_move(record)
+        for score, move in scored_moves:
+            promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+            record = board.make_move_track(move[0], move[1], promo)
+            child_hash = incremental_hash(hash_val, record)
+            search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash)
+            board.unmake_move(record)
 
-                if search_score > best_score:
-                    best_score = search_score
-                    if search_score > alpha: alpha = search_score
-                if best_score >= beta: return best_score
+            if search_score > best_score:
+                best_score = search_score
+                if search_score > alpha: alpha = search_score
+            if best_score >= beta: return best_score
 
-            return best_score
-        finally:
-            if path_added: search_path.discard(hash_val)
+        return best_score
 
     def order_moves(self, board, moves, ply, hash_move, turn, return_meta=False, counter_move=None, prev_move_tuple=None):
         if not moves: return []
@@ -902,7 +921,14 @@ class ChessBot:
                 swing = promo_bonus
                 is_good_tactic = True
 
-            if hash_move and move[0] == hash_move[0] and move[1] == hash_move[1]:
+            is_hash_move = (
+                hash_move is not None
+                and move[0] == hash_move[0]
+                and move[1] == hash_move[1]
+                and (len(move) <= 2 or len(hash_move) <= 2 or hash_move[2] is None or move[2] == hash_move[2])
+            )
+
+            if is_hash_move:
                 score = self.BONUS_PV_MOVE
             elif target_piece is not None or is_good_tactic:
                 if swing > 0:

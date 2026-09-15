@@ -1,4 +1,4 @@
-# AI.py (v2.71 - Still 99% pure; safe NMP)
+# AI.py (v2.8 - NEW)
 
 import time
 import random
@@ -80,9 +80,9 @@ class ChessBot:
     USE_IIR = True
     IIR_MIN_DEPTH = 4
 
-    TT_SIZE      = 1 << 20
+    TT_SIZE      = 1 << 19
     TT_MASK      = TT_SIZE - 1
-    EVAL_TT_SIZE = 1 << 19
+    EVAL_TT_SIZE = 1 << 18
     EVAL_TT_MASK = EVAL_TT_SIZE - 1
 
     BONUS_PV_MOVE = 10_000_000
@@ -284,6 +284,12 @@ class ChessBot:
                 if best_score <= alpha_bound:
                     alpha_bound -= window; window *= 2; retries += 1
                 elif best_score >= beta_bound:
+                    # A fail-high score is a true lower bound, so the move that
+                    # produced it is the best known first move for the re-search.
+                    # Only safe now that _search_at_depth breaks on fail-high;
+                    # without that break this could be a meaningless later move.
+                    if best_move is not None:
+                        pv_move = best_move
                     beta_bound  += window; window *= 2; retries += 1
                 else:
                     break
@@ -488,6 +494,7 @@ class ChessBot:
 
         ordered_root_moves = self.order_moves(self.board, root_moves, 0, pv_move, self.color)
         board = self.board
+        searched_any = False
 
         for move in ordered_root_moves:
             if self.cancellation_event.is_set(): raise SearchCancelledException()
@@ -512,19 +519,43 @@ class ChessBot:
                         board, depth - 1, -beta, -alpha,
                         self.opponent_color, 1, search_path,
                         current_hash=child_hash, prev_move_tuple=next_prev_tuple)
-                else:
+                elif not searched_any:
+                    # First root move takes a full window. alpha can still be
+                    # -inf here, and -(alpha + 1) would evaluate to +inf, making
+                    # a null window unrepresentable.
                     score = -self.negamax(
                         board, depth - 1, -beta, -alpha,
                         self.opponent_color, 1, search_path,
                         current_hash=child_hash, prev_move_tuple=next_prev_tuple)
+                else:
+                    # Root PVS. One move has completed the update block, so alpha
+                    # is a finite int and (-alpha-1, -alpha) is a valid null window.
+                    score = -self.negamax(
+                        board, depth - 1, -(alpha + 1), -alpha,
+                        self.opponent_color, 1, search_path,
+                        current_hash=child_hash, prev_move_tuple=next_prev_tuple)
+                    if alpha < score < beta:
+                        score = -self.negamax(
+                            board, depth - 1, -beta, -alpha,
+                            self.opponent_color, 1, search_path,
+                            current_hash=child_hash, prev_move_tuple=next_prev_tuple)
             finally:
                 board.unmake_move(record)
+
+            searched_any = True
 
             if score > best_score_this_iter:
                 best_score_this_iter = score
                 best_move_this_iter  = move
             if best_score_this_iter > alpha:
                 alpha = best_score_this_iter
+            if best_score_this_iter >= beta:
+                # Aspiration fail-high. Continuing would search the remaining root
+                # moves with an inverted window (-beta > -alpha); those return
+                # meaningless bounds, one of which can overwrite
+                # best_move_this_iter. _run_depth_iteration re-searches wider.
+                # Unreachable when beta is +inf, i.e. in the full-window path.
+                break
 
         if best_move_this_iter is not None:
             if best_score_this_iter <= orig_alpha:
@@ -554,7 +585,7 @@ class ChessBot:
 
         if board.halfmove_clock >= 100:
             return self.DRAW_SCORE
-        if total_pieces <= 8 and is_insufficient_material(board):
+        if total_pieces <= 4 and is_insufficient_material(board):
             return self.DRAW_SCORE
 
         original_alpha = alpha
@@ -782,7 +813,7 @@ class ChessBot:
         finally:
             if path_added: search_path.discard(hash_val)
 
-    def qsearch(self, board, alpha, beta, turn, ply, search_path, current_hash=None):
+    def qsearch(self, board, alpha, beta, turn, ply, search_path, current_hash=None, q_depth=0):
         self.nodes_searched += 1
         if (self.nodes_searched & self.time_check_mask) == 0:
             if self.cancellation_event.is_set() or (self.stop_time and time.time() > self.stop_time):
@@ -804,9 +835,15 @@ class ChessBot:
             if tt_flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
             if tt_flag == TT_FLAG_UPPERBOUND and tt_score <= alpha: return tt_score
 
-        if is_insufficient_material(board): return self.DRAW_SCORE
+        if len(board.white_pieces) + len(board.black_pieces) <= 4 and is_insufficient_material(board):
+            return self.DRAW_SCORE
 
-        if ply >= self.MAX_Q_SEARCH_DEPTH:
+        # q_depth counts plies inside quiescence only. ply stays root-relative, so
+        # every MATE_BOUND +/- ply correction and the -MATE_SCORE + ply return in
+        # the evasion branch below are unaffected. Comparing ply here meant qsearch
+        # switched itself off at root depth 12 and every leaf returned a raw static
+        # eval on an unresolved capture.
+        if q_depth >= self.MAX_Q_SEARCH_DEPTH:
             self.used_heuristic_eval = True
             return self._get_cached_static_eval(board, turn, hash_val)
 
@@ -843,7 +880,7 @@ class ChessBot:
                     record = board.make_move_track(move[0], move[1], promo)
                     legal_moves_count += 1
                     child_hash = incremental_hash(hash_val, record)
-                    search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash)
+                    search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash, q_depth=q_depth + 1)
                     board.unmake_move(record)
 
                     if search_score > best_score:
@@ -884,7 +921,7 @@ class ChessBot:
             promo = move[2] if len(move) > 2 and move[2] is not None else Queen
             record = board.make_move_track(move[0], move[1], promo)
             child_hash = incremental_hash(hash_val, record)
-            search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash)
+            search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash, q_depth=q_depth + 1)
             board.unmake_move(record)
 
             if search_score > best_score:
@@ -936,13 +973,18 @@ class ChessBot:
 
             if is_hash_move:
                 score = self.BONUS_PV_MOVE
-            elif target_piece is not None or is_good_tactic:
-                if swing > 0:
-                    score = self.BONUS_CAPTURE + swing
-                elif swing == 0:
-                    score = 6_000_000 - moving_piece.z_idx
-                else:
-                    score = -1_000_000 + swing  # Bad capture: rank below quiet moves
+            elif is_good_tactic:
+                # Winning or equal captures, en passant, and promotions.
+                score = self.BONUS_CAPTURE + swing
+            elif target_piece is not None:
+                # Losing or unclear capture. swing = victim*10 - attacker, so this
+                # band is [2_481_000 (KxP), 2_504_050 (QxR)]: strictly below
+                # BONUS_KILLER_2 (3_000_000) and strictly above the counter-move
+                # bonus (2_000_000). Collision with either is arithmetically
+                # impossible. The old swing<0 branch was reachable only by king
+                # captures, which are legal only onto undefended squares, so every
+                # safe king capture was being ranked below all quiet moves.
+                score = 2_500_000 + swing
             elif k1 and move[0] == k1[0] and move[1] == k1[1]:
                 score = self.BONUS_KILLER_1
             elif k2 and move[0] == k2[0] and move[1] == k2[1]:
@@ -967,7 +1009,7 @@ class ChessBot:
             return [item[1] for item in scored_moves]
 
     def evaluate_board(self, board, turn_to_move):
-        if is_insufficient_material(board):
+        if len(board.white_pieces) + len(board.black_pieces) <= 4 and is_insufficient_material(board):
             return self.DRAW_SCORE
 
         pc_wz = board.piece_counts_z['white']

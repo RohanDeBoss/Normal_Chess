@@ -303,6 +303,13 @@ def persistent_worker(work_queue, comm_queue, cancel_event, bot_class):
         if task is None:
             break
 
+        # Cleared here, by the worker, not by the UI before it enqueues. By the
+        # time we reach this line the previous search has already unwound, so a
+        # cancel signal cannot be lost. Clearing from the UI side raced a search
+        # that had not yet polled the event: for make_move that wasted CPU, for
+        # ponder_indefinitely it looped forever and every later task went unread.
+        cancel_event.clear()
+
         try:
             worker.handle_task(task, comm_queue, cancel_event)
         except Exception:
@@ -317,14 +324,16 @@ _CASUALTIES_RE = re.compile(r'\s*\(.*?\)')
 def strip_casualties(san_str):
     return _CASUALTIES_RE.sub('', san_str) if san_str else ""
 
-def generate_pgn(full_history, game_result=None):
+def generate_pgn(full_history, game_result=None, san_list=None):
     if not full_history: return ""
     moves = []
     start_turn = full_history[0][1]
     for i in range(1, len(full_history)):
         m = full_history[i][2]
         if m:
-            moves.append(format_move_san(full_history[i-1][0], full_history[i][0], m))
+            cached = san_list[i] if (san_list is not None and i < len(san_list)) else None
+            moves.append(cached if cached else
+                         format_move_san(full_history[i-1][0], full_history[i][0], m))
     pgn, move_num = "", 1
     if start_turn == 'black' and moves:
         pgn += f"{move_num}... {moves[0]} "

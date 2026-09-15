@@ -1,4 +1,4 @@
-# Opponent AI.py (v2.3 - Baseline)
+# Opponent AI.py (v2.31 - Baseline with a12 - a15 fixes with your suggested patch)
 
 import time
 import random
@@ -79,9 +79,9 @@ class OpponentAI:
     USE_IIR = True
     IIR_MIN_DEPTH = 4
 
-    TT_SIZE      = 1 << 22   # ~4.19M slots
+    TT_SIZE      = 1 << 19
     TT_MASK      = TT_SIZE - 1
-    EVAL_TT_SIZE = 1 << 21   # ~2.10M slots
+    EVAL_TT_SIZE = 1 << 18
     EVAL_TT_MASK = EVAL_TT_SIZE - 1
 
     BONUS_PV_MOVE = 10_000_000
@@ -536,7 +536,7 @@ class OpponentAI:
 
         if board.halfmove_clock >= 100:
             return self.DRAW_SCORE
-        if total_pieces <= 8 and is_insufficient_material(board):
+        if total_pieces <= 4 and is_insufficient_material(board):
             return self.DRAW_SCORE
 
         original_alpha = alpha
@@ -778,7 +778,8 @@ class OpponentAI:
             if tt_flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
             if tt_flag == TT_FLAG_UPPERBOUND and tt_score <= alpha: return tt_score
 
-        if is_insufficient_material(board): return self.DRAW_SCORE
+        if len(board.white_pieces) + len(board.black_pieces) <= 4 and is_insufficient_material(board):
+            return self.DRAW_SCORE
 
         if ply >= self.MAX_Q_SEARCH_DEPTH:
             self.used_heuristic_eval = True
@@ -808,6 +809,8 @@ class OpponentAI:
             for score, move in scored_moves:
                 promo = move[2] if len(move) > 2 and move[2] is not None else Queen
                 record = board.make_move_track(move[0], move[1], promo)
+                # Without this the counter never leaves 0, so the checkmate return
+                # below fires on EVERY in-check qsearch node that doesn't beta-cut.
                 legal_moves_count += 1
                 child_hash = incremental_hash(hash_val, record)
                 search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
@@ -926,7 +929,7 @@ class OpponentAI:
             return [item[1] for item in scored_moves]
 
     def evaluate_board(self, board, turn_to_move):
-        if is_insufficient_material(board):
+        if len(board.white_pieces) + len(board.black_pieces) <= 4 and is_insufficient_material(board):
             return self.DRAW_SCORE
 
         pc_wz = board.piece_counts_z['white']

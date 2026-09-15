@@ -742,14 +742,16 @@ def is_insufficient_material(board):
         return True
     if (w_count <= 2 and b_count == 1) or (b_count <= 2 and w_count == 1):
         return True
+    # FIDE dead position only. K+N vs K+N and K+B vs K+N are NOT draws by rule:
+    # a legal helpmate exists in both, so they stay playable and losable on time.
+    # After this change no insufficient-material position exceeds 4 pieces, which
+    # is what makes the total_pieces <= 4 guards below exact rather than heuristic.
     if w_count == 2 and b_count == 2:
         if pcz_w[2] == 1 and pcz_b[2] == 1:
             w_b_pos = next(p.pos for p in board.white_pieces if p.z_idx == 2)
             b_b_pos = next(p.pos for p in board.black_pieces if p.z_idx == 2)
             if (w_b_pos[0] + w_b_pos[1]) % 2 == (b_b_pos[0] + b_b_pos[1]) % 2:
                 return True
-        elif (pcz_w[1] == 1 and pcz_b[1] == 1) or (pcz_w[2] == 1 and pcz_b[1] == 1) or (pcz_w[1] == 1 and pcz_b[2] == 1):
-            return True
     return False
 
 _board_hash_fn = None

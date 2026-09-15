@@ -6,6 +6,7 @@ import math
 import random
 import time
 import re
+import traceback
 from GameLogic import *
 from AI import ChessBot, board_hash
 from OpponentAI import OpponentAI
@@ -48,6 +49,11 @@ class EnhancedChessApp:
         self.op_work_queue     = mp.Queue()
         self.main_cancel_event = mp.Event()
         self.op_cancel_event   = mp.Event()
+        # One flag per worker. A single shared flag was consumed by whichever
+        # engine moved first, so the other started every game with the previous
+        # game's TT, killers, counter-moves and history still loaded. Colours
+        # alternate, so which engine got the warm table alternated too.
+        self._force_clear_hash = {'main': True, 'op': True}
         self.active_worker_name = None   
         self.analysis_thinking  = False
         self.main_worker        = None   
@@ -71,6 +77,7 @@ class EnhancedChessApp:
         self.rc_start_pos       = None
 
         self.full_history         = []
+        self.san_history          = []
         self.history_pointer      = -1
         self.position_counts      = {}
         self.current_opening_sequence = []
@@ -621,6 +628,7 @@ class EnhancedChessApp:
 
     def _reset_game_state_vars(self):
         self.full_history    = [(self.board.clone(), self.turn, None)]
+        self.san_history     = [None]
         self.history_pointer = 0
         self.position_counts = {board_hash(self.board, self.turn): 1}
         self.game_over       = False
@@ -665,7 +673,7 @@ class EnhancedChessApp:
                 c += int(ch)
             else:
                 pc = _FEN_CHAR_TO_CLASS.get(ch.lower())
-                if pc:
+                if pc and 0 <= r < ROWS and 0 <= c < COLS:
                     self.board.add_piece(pc("white" if ch.isupper() else "black"), r, c)
                 c += 1
         self.turn = "white" if (parts[1] if len(parts) > 1 else 'w').lower() == 'w' else "black"
@@ -721,7 +729,7 @@ class EnhancedChessApp:
             self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
 
     def get_current_pgn(self):
-        return generate_pgn(self.full_history, self.game_result)
+        return generate_pgn(self.full_history, self.game_result, self.san_history)
 
     def copy_pgn_to_clipboard(self):
         pgn = self.get_current_pgn()
@@ -779,7 +787,9 @@ class EnhancedChessApp:
         for i in range(1, len(self.full_history)):
             m = self.full_history[i][2]
             if m:
-                formatted.append(format_move_san(self.full_history[i-1][0], self.full_history[i][0], m))
+                cached = self.san_history[i] if i < len(self.san_history) else None
+                formatted.append(cached if cached else
+                                 format_move_san(self.full_history[i-1][0], self.full_history[i][0], m))
 
         pairs = []
         if start_turn == 'black' and formatted:
@@ -826,10 +836,17 @@ class EnhancedChessApp:
         self._start_clock()
         if self.history_pointer < len(self.full_history) - 1:
             self.full_history = self.full_history[:self.history_pointer + 1]
+            self.san_history  = self.san_history[:self.history_pointer + 1]
             self.position_counts.clear()
             for board, turn, _ in self.full_history:
                 h = board_hash(board, turn)
                 self.position_counts[h] = self.position_counts.get(h, 0) + 1
+        # SAN once, here, while board_before is still addressable. Truncation
+        # above guarantees history_pointer == len(full_history) - 1 at this line.
+        # Recomputing the whole list on every redraw cost one full legal-move
+        # generation per formatted move, per ply.
+        board_before = self.full_history[self.history_pointer][0]
+        self.san_history.append(format_move_san(board_before, self.board, move) if move else None)
         self.full_history.append((self.board.clone(), self.turn, move))
         self.history_pointer += 1
         key = board_hash(self.board, self.turn)
@@ -840,6 +857,15 @@ class EnhancedChessApp:
             self.game_over   = True
             self.game_result = (status, winner)
         self.update_ui_after_state_change()
+        # _tick_clock charges the whole gap since last_clock_tick to whoever is to
+        # move NOW, and switch_turn() already ran above. Everything in between
+        # (history bookkeeping, get_game_state, move-list rebuild, full board
+        # redraw) was billed to the side about to move, and the Tk thread is
+        # blocked throughout so no tick fires to split it. Restamping hands that
+        # interval back to neither player. Note _start_clock() cannot do this job:
+        # it early-returns whenever the clock is already running.
+        if self.clock_running:
+            self.last_clock_tick = time.time()
         if self.game_over:
             print(f"Game Over! Result: {self.game_result[0]}")
             self._stop_ai_process()
@@ -874,6 +900,18 @@ class EnhancedChessApp:
                 self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
         else:
             print("AI reported no valid move.")
+            if (self.game_mode.get() == GameMode.AI_VS_AI.value
+                    and self.ai_series_running and not self.game_over):
+                # A worker that died mid-search reports None (see the traceback
+                # handler in persistent_worker). Without this the series stops
+                # here: nothing reschedules, and nothing says so.
+                print(f"ABORTED GAME (engine returned no move). FEN: {self.get_current_fen()}")
+                self.game_over   = True
+                self.game_result = ('aborted', None)
+                self.update_ui_after_state_change()
+                self._stop_ai_process()
+                self.process_ai_series_result()
+                return
             
         self._stop_ai_process()
         self.update_bot_labels()
@@ -1207,14 +1245,14 @@ class EnhancedChessApp:
                 capstyle=tk.ROUND, joinstyle=tk.ROUND, tags=tags)
 
     def clear_hash_manually(self):
-        self._force_clear_hash = True
+        self._force_clear_hash = {'main': True, 'op': True}
         self._stop_ai_process(invalidate_task=True)
         print("\n--- Transposition Table & History Cleared ---")
         if self.analysis_mode_var.get() and self.game_mode.get() == GameMode.HUMAN_VS_HUMAN.value:
             self._update_analysis_after_state_change()
 
     def reset_game(self, schedule_ai=True):
-        self._force_clear_hash = True
+        self._force_clear_hash = {'main': True, 'op': True}
         if self.game_mode.get() != GameMode.AI_VS_AI.value:
             self.ai_series_running = False
         self._stop_ai_process()
@@ -1517,7 +1555,10 @@ class EnhancedChessApp:
                         self.analysis_thinking  = False
                         self._execute_ai_move(msg[1])
         except Exception:
-            pass
+            # Was a bare pass. One bad message aborted the rest of the drain and
+            # hid the cause completely, which in AI-vs-AI stalls the series.
+            if not self._shutting_down:
+                traceback.print_exc()
         finally:
             if not self._shutting_down:
                 try:
@@ -1555,6 +1596,7 @@ class EnhancedChessApp:
         if self.active_worker_name is not None:
             return   
 
+        worker_key  = 'main' if bot_class is ChessBot else 'op'
         is_analysis = (bot_name == self.ANALYSIS_AI_NAME)
         time_left = ((self.white_time if self.turn == 'white' else self.black_time) \
                     if self.use_clock_var.get() else None) if not is_analysis else None
@@ -1574,19 +1616,19 @@ class EnhancedChessApp:
             'increment':        inc,
             'use_opening_book': self.use_opening_book_var.get(),
             'show_tt_fullness': self.show_tt_fullness_var.get(),
-            'clear_hash':       getattr(self, '_force_clear_hash', False),
+            'clear_hash':       self._force_clear_hash.get(worker_key, False),
             'task_id':          self.current_task_id
         }
-        self._force_clear_hash = False
+        self._force_clear_hash[worker_key] = False
 
         self.analysis_thinking = (bot_name == self.ANALYSIS_AI_NAME)
 
+        # No .clear() here: the worker clears as it dequeues (see A16). Clearing
+        # from this side races a search that has not polled the event yet.
         if bot_class is ChessBot:
-            self.main_cancel_event.clear()
             self.active_worker_name = 'main'
             self.main_work_queue.put(task)
         else:
-            self.op_cancel_event.clear()
             self.active_worker_name = 'op'
             self.op_work_queue.put(task)
 
@@ -1890,8 +1932,12 @@ class EnhancedChessApp:
 
     def process_ai_series_result(self):
         self.ai_series_stats['game_count'] += 1
-        _, wc = self.game_result
-        if wc:
+        res, wc = self.game_result
+        if res == 'aborted':
+            # Kept out of the draw column so a crashed worker cannot quietly
+            # launder itself into the Elo calculation.
+            self.ai_series_stats['aborts'] = self.ai_series_stats.get('aborts', 0) + 1
+        elif wc:
             main_color = 'white' if self.white_playing_bot_type == 'main' else 'black'
             self.ai_series_stats['my_ai_wins' if wc == main_color else 'op_ai_wins'] += 1
         else:
@@ -1940,7 +1986,8 @@ class EnhancedChessApp:
                 f"{self.MAIN_AI_NAME} vs {self.OPPONENT_AI_NAME} "
                 f"({s['game_count']}/{self.AI_SERIES_GAMES} games)\n"
                 f"  {self.MAIN_AI_NAME}: {s['my_ai_wins']}  "
-                f"{self.OPPONENT_AI_NAME}: {s['op_ai_wins']}  Draws: {s['draws']}"))
+                f"{self.OPPONENT_AI_NAME}: {s['op_ai_wins']}  Draws: {s['draws']}"
+                + (f"  Aborts: {s['aborts']}" if s.get('aborts') else "")))
         else:
             self.scoreboard_label.config(text="")
 

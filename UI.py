@@ -1562,7 +1562,7 @@ class EnhancedChessApp:
         finally:
             if not self._shutting_down:
                 try:
-                    self.master.after(20, self.process_comm_queue)
+                    self.master.after(5, self.process_comm_queue)
                 except Exception:
                     pass
 

@@ -1,4 +1,4 @@
-# Opponent AI.py (v2.31 - Baseline with a12 - a15 fixes with your suggested patch)
+# Opponent AI.py (v2.8 - NEW Baseline)
 
 import time
 import random
@@ -62,17 +62,18 @@ class OpponentAI:
     DRAW_SCORE = DRAW_SCORE
 
     MAX_Q_SEARCH_DEPTH = 12
+    USE_LMR = True
     LMR_DEPTH_THRESHOLD = 3
     LMR_MOVE_COUNT_THRESHOLD = 4
     NMP_MIN_DEPTH = 3
     NMP_BASE_REDUCTION = 2
     NMP_DEPTH_DIVISOR = 6
-    USE_NULL_MOVE_PRUNING = True
+    USE_NULL_MOVE_PRUNING = True    # Re-enabled with strict Zugzwang protection
 
-    USE_FUTILITY_PRUNING = True
-    FUTILITY_MARGIN = 350
+    USE_FUTILITY_REDUCTION = True
+    FUTILITY_MARGIN_PER_DEPTH = 150
 
-    USE_REVERSE_FUTILITY_PRUNING = True
+    USE_REVERSE_FUTILITY_PRUNING = False
     RFP_MAX_DEPTH = 2
     RFP_MARGIN_PER_DEPTH = 150
 
@@ -201,7 +202,22 @@ class OpponentAI:
         stored_depth = self.tt_depths[idx]
         same_position = (stored_depth != -1 and self.tt_keys[idx] == hash_val)
 
-        if stored_depth == -1 or self.tt_ages[idx] < self.current_age or depth >= stored_depth:
+        # Replacement Strategy:
+        # 1. Same position: NEVER replace a deeper search with a shallower one.
+        # 2. Hash collision: Only evict if empty, deeper, 3+ turns old,
+        #    or depth exceeds age-decayed priority (2 plies per turn).
+        if same_position:
+            replace = (depth >= stored_depth)
+        else:
+            age_diff = self.current_age - self.tt_ages[idx]
+            replace = (
+                stored_depth == -1
+                or depth >= stored_depth
+                or age_diff >= 3
+                or depth >= (stored_depth - age_diff * 2)
+            )
+
+        if replace:
             if stored_depth == -1:
                 self.tt_filled += 1
             self.tt_keys[idx]   = hash_val
@@ -268,6 +284,12 @@ class OpponentAI:
                 if best_score <= alpha_bound:
                     alpha_bound -= window; window *= 2; retries += 1
                 elif best_score >= beta_bound:
+                    # A fail-high score is a true lower bound, so the move that
+                    # produced it is the best known first move for the re-search.
+                    # Only safe now that _search_at_depth breaks on fail-high;
+                    # without that break this could be a meaningless later move.
+                    if best_move is not None:
+                        pv_move = best_move
                     beta_bound  += window; window *= 2; retries += 1
                 else:
                     break
@@ -472,6 +494,7 @@ class OpponentAI:
 
         ordered_root_moves = self.order_moves(self.board, root_moves, 0, pv_move, self.color)
         board = self.board
+        searched_any = False
 
         for move in ordered_root_moves:
             if self.cancellation_event.is_set(): raise SearchCancelledException()
@@ -496,19 +519,43 @@ class OpponentAI:
                         board, depth - 1, -beta, -alpha,
                         self.opponent_color, 1, search_path,
                         current_hash=child_hash, prev_move_tuple=next_prev_tuple)
-                else:
+                elif not searched_any:
+                    # First root move takes a full window. alpha can still be
+                    # -inf here, and -(alpha + 1) would evaluate to +inf, making
+                    # a null window unrepresentable.
                     score = -self.negamax(
                         board, depth - 1, -beta, -alpha,
                         self.opponent_color, 1, search_path,
                         current_hash=child_hash, prev_move_tuple=next_prev_tuple)
+                else:
+                    # Root PVS. One move has completed the update block, so alpha
+                    # is a finite int and (-alpha-1, -alpha) is a valid null window.
+                    score = -self.negamax(
+                        board, depth - 1, -(alpha + 1), -alpha,
+                        self.opponent_color, 1, search_path,
+                        current_hash=child_hash, prev_move_tuple=next_prev_tuple)
+                    if alpha < score < beta:
+                        score = -self.negamax(
+                            board, depth - 1, -beta, -alpha,
+                            self.opponent_color, 1, search_path,
+                            current_hash=child_hash, prev_move_tuple=next_prev_tuple)
             finally:
                 board.unmake_move(record)
+
+            searched_any = True
 
             if score > best_score_this_iter:
                 best_score_this_iter = score
                 best_move_this_iter  = move
             if best_score_this_iter > alpha:
                 alpha = best_score_this_iter
+            if best_score_this_iter >= beta:
+                # Aspiration fail-high. Continuing would search the remaining root
+                # moves with an inverted window (-beta > -alpha); those return
+                # meaningless bounds, one of which can overwrite
+                # best_move_this_iter. _run_depth_iteration re-searches wider.
+                # Unreachable when beta is +inf, i.e. in the full-window path.
+                break
 
         if best_move_this_iter is not None:
             if best_score_this_iter <= orig_alpha:
@@ -530,8 +577,10 @@ class OpponentAI:
         total_pieces = len(board.white_pieces) + len(board.black_pieces)
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
+        game_count = self.position_counts.get(hash_val, 0)
         if ply > 0:
-            if self.position_counts.get(hash_val, 0) + (1 if hash_val in search_path else 0) >= 2:
+            # Immediate cycle on current search branch, or 3rd occurrence of a game position
+            if hash_val in search_path or game_count >= 2:
                 return self.DRAW_SCORE
 
         if board.halfmove_clock >= 100:
@@ -543,13 +592,13 @@ class OpponentAI:
         tt_idx = self._tt_probe(hash_val)
         hash_move = self.tt_moves[tt_idx] if tt_idx != -1 else None
 
-        if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth:
+        # Only take score cutoffs if position has not occurred in the game history (GHI safeguard)
+        if ply > 0 and tt_idx != -1 and self.tt_depths[tt_idx] >= depth and game_count == 0:
             tt_score = self.tt_scores[tt_idx]
             if tt_score > MATE_BOUND: tt_score -= ply
             elif tt_score < -MATE_BOUND: tt_score += ply
 
             self.used_heuristic_eval = True
-
             tt_flag = self.tt_flags[tt_idx]
             if tt_flag == TT_FLAG_EXACT:
                 return tt_score
@@ -559,7 +608,7 @@ class OpponentAI:
                 if tt_score < beta: beta = tt_score
             if alpha >= beta: return tt_score
 
-        if depth <= 0: return self.qsearch(board, alpha, beta, turn, ply, current_hash=hash_val)
+        if depth <= 0: return self.qsearch(board, alpha, beta, turn, ply, search_path, current_hash=hash_val)
 
         opponent_turn    = 'black' if turn == 'white' else 'white'
         is_in_check_flag = is_in_check(board, turn)
@@ -587,9 +636,13 @@ class OpponentAI:
             if (self.USE_NULL_MOVE_PRUNING and depth >= self.NMP_MIN_DEPTH and
                     ply > 0 and not is_in_check_flag and abs(beta) < MATE_BOUND
                     and total_pieces > 6):
-                pc_w, pc_b = board.pc_w, board.pc_b
-                if (pc_w[1] + pc_w[2] + pc_w[3] + pc_w[4] > 0 and
-                        pc_b[1] + pc_b[2] + pc_b[3] + pc_b[4] > 0):
+                my_pc = board.pc_w if turn == 'white' else board.pc_b
+                # Zugzwang-Safe Guard: Side to move must hold at least 1 major piece (R/Q)
+                # or at least 2 minor pieces (N/B). In pawn or 1-minor endgames, NMP is strictly disabled.
+                has_major = (my_pc[3] + my_pc[4] > 0)
+                has_two_minors = (my_pc[1] + my_pc[2] >= 2)
+
+                if has_major or has_two_minors:
                     self.used_heuristic_eval = True
                     if static_eval is None:
                         static_eval = self._get_cached_static_eval(board, turn, hash_val)
@@ -610,14 +663,14 @@ class OpponentAI:
                         if score >= beta: 
                             return score if score < MATE_BOUND else beta
 
-            futility_prune = False
-            if (self.USE_FUTILITY_PRUNING and depth == 1 and not is_in_check_flag and
+            futility_reduction_active = False
+            if (self.USE_FUTILITY_REDUCTION and depth <= 3 and not is_in_check_flag and
                     abs(alpha) < MATE_BOUND and total_pieces > 6):
                 self.used_heuristic_eval = True
                 if static_eval is None:
                     static_eval = self._get_cached_static_eval(board, turn, hash_val)
-                if static_eval + self.FUTILITY_MARGIN < alpha:
-                    futility_prune = True
+                if static_eval + self.FUTILITY_MARGIN_PER_DEPTH * depth < alpha:
+                    futility_reduction_active = True
 
             legal_moves = get_all_legal_moves(board, turn)
 
@@ -650,14 +703,11 @@ class OpponentAI:
                 legal_moves_count += 1
                 if not is_good_tactic: quiet_moves_tried.append((move, moving_piece))
 
-                if futility_prune and not is_good_tactic and legal_moves_count > 1:
-                    if not is_in_check(board, opponent_turn):
-                        board.unmake_move(record)
-                        continue
-
                 reduction = 0
                 is_castling = (moving_piece.z_idx == 5 and abs(move[1][1] - move[0][1]) == 2)
-                if (depth >= self.LMR_DEPTH_THRESHOLD and
+
+                # 1. Standard Late Move Reduction
+                if (self.USE_LMR and depth >= self.LMR_DEPTH_THRESHOLD and
                         legal_moves_count > self.LMR_MOVE_COUNT_THRESHOLD and
                         not is_in_check_flag and not is_good_tactic and not is_castling):
                     reduction = 1 + (depth // 6) + (legal_moves_count // 12)
@@ -675,8 +725,13 @@ class OpponentAI:
                     # 10_000 correctly matches the 2,000,000 gravity table scale
                     if history_table[f_sq][t_sq] > 10_000:
                         reduction -= 1
-                        
-                    reduction = max(0, min(reduction, depth - 2))
+
+                # 2. Futility Reduction: Softly reduce quiet moves when position is far below alpha
+                # (Safe for variants: never discards the move, triggers PVS re-search if score > alpha)
+                if futility_reduction_active and not is_good_tactic and not is_castling and legal_moves_count > 1:
+                    reduction += 1
+
+                reduction = max(0, min(reduction, depth - 1))
 
                 search_depth_child = depth - 1 - reduction
                 next_prev_tuple = (move, moving_piece.z_idx)
@@ -758,21 +813,23 @@ class OpponentAI:
         finally:
             if path_added: search_path.discard(hash_val)
 
-    def qsearch(self, board, alpha, beta, turn, ply, current_hash=None):
+    def qsearch(self, board, alpha, beta, turn, ply, search_path, current_hash=None, q_depth=0):
         self.nodes_searched += 1
         if (self.nodes_searched & self.time_check_mask) == 0:
             if self.cancellation_event.is_set() or (self.stop_time and time.time() > self.stop_time):
                 raise SearchCancelledException()
 
         hash_val = current_hash if current_hash is not None else board_hash(board, turn)
-        if ply > 0 and self.position_counts.get(hash_val, 0) >= 2:
+        game_count = self.position_counts.get(hash_val, 0)
+        if ply > 0 and (hash_val in search_path or game_count >= 2):
             return self.DRAW_SCORE
 
         tt_idx = self._tt_probe(hash_val)
-        if tt_idx != -1:
+        if tt_idx != -1 and game_count == 0:
             tt_score = self.tt_scores[tt_idx]
             if tt_score > MATE_BOUND: tt_score -= ply
             elif tt_score < -MATE_BOUND: tt_score += ply
+
             tt_flag = self.tt_flags[tt_idx]
             if tt_flag == TT_FLAG_EXACT: return tt_score
             if tt_flag == TT_FLAG_LOWERBOUND and tt_score >= beta: return tt_score
@@ -781,7 +838,12 @@ class OpponentAI:
         if len(board.white_pieces) + len(board.black_pieces) <= 4 and is_insufficient_material(board):
             return self.DRAW_SCORE
 
-        if ply >= self.MAX_Q_SEARCH_DEPTH:
+        # q_depth counts plies inside quiescence only. ply stays root-relative, so
+        # every MATE_BOUND +/- ply correction and the -MATE_SCORE + ply return in
+        # the evasion branch below are unaffected. Comparing ply here meant qsearch
+        # switched itself off at root depth 12 and every leaf returned a raw static
+        # eval on an unresolved capture.
+        if q_depth >= self.MAX_Q_SEARCH_DEPTH:
             self.used_heuristic_eval = True
             return self._get_cached_static_eval(board, turn, hash_val)
 
@@ -792,40 +854,48 @@ class OpponentAI:
         tt_move = self.tt_moves[tt_idx] if tt_idx != -1 else None
         grid = board.grid
 
+        # 1. IN CHECK: Evasions include quiet moves which CAN repeat.
+        # Track search_path here to stop perpetual checks.
         if is_in_check_flag:
-            candidate_moves = get_all_legal_moves(board, turn)
-            scored_moves = []
-            for move in candidate_moves:
-                (r1, c1), (r2, c2) = move[:2]
-                moving_piece = grid[r1][c1]
-                target_piece = grid[r2][c2]
-                swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
-                score = swing * 10 - moving_piece.z_idx
-                if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
-                scored_moves.append((score, move))
-            scored_moves.sort(key=itemgetter(0), reverse=True)
+            path_added = False
+            if hash_val not in search_path:
+                search_path.add(hash_val)
+                path_added = True
+            try:
+                candidate_moves = get_all_legal_moves(board, turn)
+                scored_moves = []
+                for move in candidate_moves:
+                    (r1, c1), (r2, c2) = move[:2]
+                    moving_piece = grid[r1][c1]
+                    target_piece = grid[r2][c2]
+                    swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
+                    score = swing * 10 - moving_piece.z_idx
+                    if tt_move and move[:2] == tt_move[:2]: score += 1_000_000
+                    scored_moves.append((score, move))
+                scored_moves.sort(key=itemgetter(0), reverse=True)
 
-            legal_moves_count = 0
-            for score, move in scored_moves:
-                promo = move[2] if len(move) > 2 and move[2] is not None else Queen
-                record = board.make_move_track(move[0], move[1], promo)
-                # Without this the counter never leaves 0, so the checkmate return
-                # below fires on EVERY in-check qsearch node that doesn't beta-cut.
-                legal_moves_count += 1
-                child_hash = incremental_hash(hash_val, record)
-                search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
-                board.unmake_move(record)
+                legal_moves_count = 0
+                for score, move in scored_moves:
+                    promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+                    record = board.make_move_track(move[0], move[1], promo)
+                    legal_moves_count += 1
+                    child_hash = incremental_hash(hash_val, record)
+                    search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash, q_depth=q_depth + 1)
+                    board.unmake_move(record)
 
-                if search_score > best_score:
-                    best_score = search_score
-                    if search_score > alpha: alpha = search_score
-                if best_score >= beta: return best_score
+                    if search_score > best_score:
+                        best_score = search_score
+                        if search_score > alpha: alpha = search_score
+                    if best_score >= beta: return best_score
 
-            if legal_moves_count == 0:
-                return -self.MATE_SCORE + ply
-            return best_score
+                if legal_moves_count == 0:
+                    return -self.MATE_SCORE + ply
+                return best_score
+            finally:
+                if path_added: search_path.discard(hash_val)
 
-        # Not in check: Generate ONLY captures and tactical promotions (2x speedup!)
+        # 2. NOT IN CHECK: Captures & promotions are irreversible.
+        # Cycles are impossible, so we omit search_path.add/discard for max speed.
         stand_pat = self._get_cached_static_eval(board, turn, hash_val)
         best_score = stand_pat
         if stand_pat >= beta: return stand_pat
@@ -839,12 +909,10 @@ class OpponentAI:
             moving_piece = grid[r1][c1]
             target_piece = grid[r2][c2]
 
-            swing, is_tactic = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
-            if not is_tactic: continue
-            if stand_pat + swing + 200 < alpha: continue
+            swing, _ = fast_approximate_material_swing(board, move, moving_piece, target_piece, ORDERING_VALUES)
 
             score = swing * 10 - moving_piece.z_idx
-            if tt_move and move[0] == tt_move[0] and move[1] == tt_move[1]: score += 1_000_000
+            if tt_move and move[:2] == tt_move[:2]: score += 1_000_000
             scored_moves.append((score, move))
 
         scored_moves.sort(key=itemgetter(0), reverse=True)
@@ -853,7 +921,7 @@ class OpponentAI:
             promo = move[2] if len(move) > 2 and move[2] is not None else Queen
             record = board.make_move_track(move[0], move[1], promo)
             child_hash = incremental_hash(hash_val, record)
-            search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, current_hash=child_hash)
+            search_score = -self.qsearch(board, -beta, -alpha, opponent_turn, ply + 1, search_path, current_hash=child_hash, q_depth=q_depth + 1)
             board.unmake_move(record)
 
             if search_score > best_score:
@@ -896,15 +964,27 @@ class OpponentAI:
                 swing = promo_bonus
                 is_good_tactic = True
 
-            if hash_move and move[0] == hash_move[0] and move[1] == hash_move[1]:
+            is_hash_move = (
+                hash_move is not None
+                and move[0] == hash_move[0]
+                and move[1] == hash_move[1]
+                and (len(move) <= 2 or len(hash_move) <= 2 or hash_move[2] is None or move[2] == hash_move[2])
+            )
+
+            if is_hash_move:
                 score = self.BONUS_PV_MOVE
-            elif target_piece is not None or is_good_tactic:
-                if swing > 0:
-                    score = self.BONUS_CAPTURE + swing
-                elif swing == 0:
-                    score = 6_000_000 - moving_piece.z_idx
-                else:
-                    score = -1_000_000 + swing  # Bad capture: rank below quiet moves
+            elif is_good_tactic:
+                # Winning or equal captures, en passant, and promotions.
+                score = self.BONUS_CAPTURE + swing
+            elif target_piece is not None:
+                # Losing or unclear capture. swing = victim*10 - attacker, so this
+                # band is [2_481_000 (KxP), 2_504_050 (QxR)]: strictly below
+                # BONUS_KILLER_2 (3_000_000) and strictly above the counter-move
+                # bonus (2_000_000). Collision with either is arithmetically
+                # impossible. The old swing<0 branch was reachable only by king
+                # captures, which are legal only onto undefended squares, so every
+                # safe king capture was being ranked below all quiet moves.
+                score = 2_500_000 + swing
             elif k1 and move[0] == k1[0] and move[1] == k1[1]:
                 score = self.BONUS_KILLER_1
             elif k2 and move[0] == k2[0] and move[1] == k2[1]:

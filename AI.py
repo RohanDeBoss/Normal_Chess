@@ -1,4 +1,4 @@
-# AI.py (v2.8 - NEW)
+# AI.py (v2.81 - B side fixes too!)
 
 import time
 import random
@@ -252,7 +252,11 @@ class ChessBot:
         optimum_time = min(optimum_time, clock_ceiling)
 
         max_time = min(clock_ceiling, optimum_time * self.TIME_MAX_MULTIPLIER)
-        max_time = max(max_time, min(self.MIN_MOVE_TIME, clock_ceiling))
+        # clock_ceiling reaches 0 as soon as time_left <= buffer, which drove
+        # max_time to 0 and made stop_time == now: the first node check raised and
+        # the engine played root_moves[0] for the rest of the game. Floor against
+        # time_left instead, capped at half the clock so this cannot flag.
+        max_time = max(max_time, min(self.MIN_MOVE_TIME, time_left * 0.5))
         return optimum_time, max_time
 
     def _format_move(self, board_before, move):
@@ -336,6 +340,13 @@ class ChessBot:
                 book_options = OPENING_BOOK.get(fen_key)
                 if book_options is None:
                     book_options = OPENING_BOOK.get(full_fen)  # Fallback just in case
+                if book_options is None:
+                    fen_fields = full_fen.split()
+                    if len(fen_fields) > 3 and fen_fields[3] != '-':
+                        # Books exported with python-chess write '-' unless an en
+                        # passant capture is actually legal. board_to_fen always
+                        # writes the square, so 1.e4 would miss every time.
+                        book_options = OPENING_BOOK.get(" ".join(fen_fields[:3]) + " -")
                     
                 if book_options:
                     weights = [opt["weight"] for opt in book_options]
@@ -360,11 +371,16 @@ class ChessBot:
                 self._report_move(root_moves[0])
                 return
 
-            best_move_overall  = root_moves[0]
+            root_hash          = board_hash(self.board, self.color)
             prev_iter_score    = None
             prev_iter_duration = None
             total_nodes        = 0
-            root_hash          = board_hash(self.board, self.color)
+            # Fallback when depth 1 is cancelled before it completes. root_moves[0]
+            # is just whatever the generator emitted first; the TT move from the
+            # previous search of this exact position is far better.
+            _tt_idx            = self._tt_probe(root_hash)
+            _tt_root_move      = self.tt_moves[_tt_idx] if _tt_idx != -1 else None
+            best_move_overall  = _tt_root_move if _tt_root_move in root_moves else root_moves[0]
 
             search_start_time = time.time()
             if self.time_left is not None and self.increment is not None:
@@ -397,7 +413,7 @@ class ChessBot:
 
                 eval_for_ui = best_score_this_iter if self.color == 'white' else -best_score_this_iter
                 tt_str = f", TT={int((self.tt_filled / self.TT_SIZE) * 1000)}/1000" if getattr(self, 'show_tt_fullness', False) else ""
-                self._report_log(f"  > {self.bot_name} (D{current_depth}): {self._format_move(self.board, best_move_this_iter)}, Eval={eval_for_ui/100:+.2f}, NodesTotal={total_nodes}, KNPS={knps:.1f}{tt_str}, Time={iter_duration:.2f}s")
+                self._report_log(f"  > {self.bot_name} (D{current_depth}): {self._format_move(self.board, best_move_this_iter)}, Eval={eval_for_ui/100:+.2f}, NodesTotal={total_nodes}, KNPS={knps:.1f}{tt_str}, Time={time.time() - search_start_time:.2f}s, Iter={iter_duration:.2f}s")
                 self._report_eval(best_score_this_iter, current_depth)
 
                 pv_str, pv_raw = self._get_pv_data(current_depth, best_move_this_iter)
@@ -952,7 +968,15 @@ class ChessBot:
             swing = 0
             
             is_pawn = (moving_piece.z_idx == 0)
-            promo_bonus = (ORDERING_VALUES[4] - ORDERING_VALUES[0]) if (is_pawn and r2 == moving_piece.promo_rank) else 0
+            if is_pawn and r2 == moving_piece.promo_rank:
+                # Was a flat +850 for all four promotion pieces, so Q/R/B/N tied
+                # and only came out in the right order because list.sort is stable
+                # and the generator happens to emit Queen first. Any variant that
+                # reorders that tuple would start preferring underpromotion.
+                promo_cls   = move[2] if len(move) > 2 and move[2] is not None else Queen
+                promo_bonus = ORDERING_VALUES[promo_cls.z_idx] - ORDERING_VALUES[0]
+            else:
+                promo_bonus = 0
 
             if target_piece is not None:
                 swing = ORDERING_VALUES[target_piece.z_idx] * 10 - ORDERING_VALUES[moving_piece.z_idx] + promo_bonus
@@ -1204,14 +1228,17 @@ rook_pst = [
     [  0,   0,   0,   5,   5,   0,   0,   0]
 ]
 
+# Rows 4, 5 and 6 were not mirror-symmetric across files (the CPW transcription
+# artifact), so the engine scored a position and its file-mirror differently.
+# Each asymmetric cell takes the right-hand (more conservative) value.
 queen_pst = [
     [-20, -10, -10,  -5,  -5, -10, -10, -20],
     [-10,   0,   0,   0,   0,   0,   0, -10],
     [-10,   0,   5,   5,   5,   5,   0, -10],
     [ -5,   0,   5,   5,   5,   5,   0,  -5],
-    [  0,   0,   5,   5,   5,   5,   0,  -5],
-    [-10,   5,   5,   5,   5,   5,   0, -10],
-    [-10,   0,   5,   0,   0,   0,   0, -10],
+    [ -5,   0,   5,   5,   5,   5,   0,  -5],
+    [-10,   0,   5,   5,   5,   5,   0, -10],
+    [-10,   0,   0,   0,   0,   0,   0, -10],
     [-20, -10, -10,  -5,  -5, -10, -10, -20]
 ]
 
@@ -1220,7 +1247,7 @@ king_midgame_pst = [
     [-30, -40, -40, -50, -50, -40, -40, -30],
     [-30, -40, -40, -50, -50, -40, -40, -30],
     [-30, -40, -40, -50, -50, -40, -40, -30],
-    [-20, -30, -30, -40, -40, -30, -20, -20],
+    [-20, -30, -30, -40, -40, -30, -30, -20],
     [-10, -20, -20, -20, -20, -20, -20, -10],
     [ 20,  20,   5,   5,   5,   5,  20,  20],
     [ 20,  25,  15,  15,  15,  15,  25,  20]

@@ -1866,10 +1866,10 @@ class EnhancedChessApp:
         text.tag_config("normal", font=("Helvetica", 11), spacing3=4)
 
         try:
-            with open("Zreadme.txt", "r", encoding="utf-8") as f:
+            with open("zreadme.txt", "r", encoding="utf-8") as f:
                 readme_text = f.read()
         except FileNotFoundError:
-            readme_text = "# Error\nCould not find `Zreadme.txt` in the current directory."
+            readme_text = "# Error\nCould not find `zreadme.txt` in the current directory."
 
         lines = readme_text.split('\n')
         in_code_block = False

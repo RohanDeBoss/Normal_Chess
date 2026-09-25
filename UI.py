@@ -1,4 +1,4 @@
-# ChessUI.py (v2.12 Console cleanup)
+# UI.py (v2.13 - gameplay UI only)
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -7,18 +7,17 @@ import random
 import time
 import re
 import traceback
+import os
 from GameLogic import *
 from AI import ChessBot, board_hash
 from OpponentAI import OpponentAI
 from EngineRuntime import (
     persistent_worker,
     generate_pgn,
-    generate_series_opening_sequence,
-    write_series_stats_file,
     strip_casualties,
     board_to_fen,
 )
-from MoveChecker import launch_move_checker_dialog
+from tests.position_validation import FenError, parse_fen
 from enum import Enum
 import multiprocessing as mp
 
@@ -26,8 +25,6 @@ class GameMode(Enum):
     HUMAN_VS_BOT   = "bot"
     HUMAN_VS_HUMAN = "human"
     AI_VS_AI       = "ai_vs_ai"
-
-_FEN_CHAR_TO_CLASS = {'p': Pawn, 'n': Knight, 'b': Bishop, 'r': Rook, 'q': Queen, 'k': King}
 
 class EnhancedChessApp:
     MAIN_AI_NAME     = "AI Bot"
@@ -80,7 +77,6 @@ class EnhancedChessApp:
         self.san_history          = []
         self.history_pointer      = -1
         self.position_counts      = {}
-        self.current_opening_sequence = []
         self.square_size          = 75
         self.base_sidebar_width   = 280
 
@@ -88,10 +84,7 @@ class EnhancedChessApp:
         self.analysis_mode_var   = tk.BooleanVar(value=True)
         self.ai_series_running   = False
         self.ai_series_stats     = {'game_count': 0, 'my_ai_wins': 0, 'op_ai_wins': 0, 'draws': 0}
-        self.move_stats          = {}
-        self._pending_move_stat  = {}
-        
-        self.auto_save_stats_var  = tk.BooleanVar(value=True)
+        self.current_opening_sequence = []
         self.show_pv_var          = tk.BooleanVar(value=True)
         self.long_notation_var    = tk.BooleanVar(value=False)
         self.instant_move         = tk.BooleanVar(value=False)
@@ -361,11 +354,10 @@ class EnhancedChessApp:
         cf = ttk.Frame(parent, style='Left.TFrame')
         cf.pack(fill=tk.X, pady=5)
         self.controls_frame = cf
-        for txt, cmd in [("NEW GAME",        self.reset_game),
-                         ("SWAP SIDES",      self.swap_sides),
-                         ("CLEAR HASH",      self.clear_hash_manually),
-                         ("AI vs OP Series", self.start_ai_series),
-                         ("VERIFY PERFT",    self.run_move_checker)]:
+        for txt, cmd in [("NEW GAME",   self.reset_game),
+                         ("SWAP SIDES", self.swap_sides),
+                         ("CLEAR HASH", self.clear_hash_manually),
+                         ("AI vs OP Series", self.start_ai_series)]:
             ttk.Button(cf, text=txt, command=cmd, style='Control.TButton').pack(fill=tk.X, pady=3)
         self.flip_view_btn = ttk.Button(cf, text="FLIP VIEW",
                                         command=self.toggle_board_view, style='Control.TButton')
@@ -383,7 +375,6 @@ class EnhancedChessApp:
             ("Use Opening Book",           self.use_opening_book_var, None),
             ("Instant Moves",              self.instant_move,         None),
             ("Analysis Mode (H-vs-H)",     self.analysis_mode_var,    self._update_analysis_after_state_change),
-            ("Auto-save Depth Stats",      self.auto_save_stats_var,  None),
             ("Show Engine Lines (PV)",     self.show_pv_var,          self._render_pv),
             ("Show TT Fullness",           self.show_tt_fullness_var, None),
         ]:
@@ -659,57 +650,15 @@ class EnhancedChessApp:
         self.master.clipboard_append(fen)
 
     def load_fen_from_entry(self):
-        fen = self.fen_entry.get().strip()
-        if not fen:
+        try:
+            board, turn, _ = parse_fen(self.fen_entry.get())
+        except FenError as error:
+            messagebox.showerror("Invalid FEN", str(error))
             return
-        parts = fen.split()
+
         self._stop_ai_process()
-        self.board = Board(setup=False)
-        r = c = 0
-        for ch in parts[0]:
-            if ch == '/':
-                r += 1; c = 0
-            elif ch.isdigit():
-                c += int(ch)
-            else:
-                pc = _FEN_CHAR_TO_CLASS.get(ch.lower())
-                if pc and 0 <= r < ROWS and 0 <= c < COLS:
-                    self.board.add_piece(pc("white" if ch.isupper() else "black"), r, c)
-                c += 1
-        self.turn = "white" if (parts[1] if len(parts) > 1 else 'w').lower() == 'w' else "black"
-
-        self.board.castling_rights = 0
-        if len(parts) > 2:
-            if parts[2] != '-':
-                if 'K' in parts[2]: self.board.castling_rights |= CASTLE_WK
-                if 'Q' in parts[2]: self.board.castling_rights |= CASTLE_WQ
-                if 'k' in parts[2]: self.board.castling_rights |= CASTLE_BK
-                if 'q' in parts[2]: self.board.castling_rights |= CASTLE_BQ
-        else:
-            # Only the standard start position defaults to KQkq if flags were omitted
-            if parts[0] == "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR":
-                self.board.castling_rights = 15
-
-        # Parse En Passant
-        self.board.ep_square = None
-        if len(parts) > 3 and parts[3] != '-':
-            ep_str = parts[3].lower()
-            valid_ep_rank = '6' if self.turn == 'white' else '3'
-            if len(ep_str) == 2 and ep_str[0] in 'abcdefgh' and ep_str[1] == valid_ep_rank:
-                self.board.ep_square = (8 - int(ep_str[1]), ord(ep_str[0]) - ord('a'))
-
-        self.board.halfmove_clock = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
-
-        if not self.board.white_king_pos or not self.board.black_king_pos:
-            messagebox.showerror("Invalid FEN", "Illegal Position: Both Kings must be present on the board.")
-            self.reset_game(schedule_ai=False)
-            return
-
-        passive_color = "black" if self.turn == "white" else "white"
-        if is_in_check(self.board, passive_color):
-            messagebox.showerror("Invalid FEN", f"Illegal Position: The side not to move ({passive_color}) is already in check.")
-            self.reset_game(schedule_ai=False)
-            return
+        self.board = board
+        self.turn = turn
 
         self.game_started = True
         self._reset_clock_state()
@@ -718,7 +667,7 @@ class EnhancedChessApp:
         status, winner = get_game_state(self.board, self.turn, self.position_counts,
                                         self.history_pointer, self.MAX_GAME_MOVES)
         if status != "ongoing":
-            self.game_over   = True
+            self.game_over = True
             self.game_result = (status, winner)
         self.board_orientation = self.human_color
         self._update_flip_view_button_style()
@@ -900,19 +849,13 @@ class EnhancedChessApp:
                 self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
         else:
             print("AI reported no valid move.")
-            if (self.game_mode.get() == GameMode.AI_VS_AI.value
-                    and self.ai_series_running and not self.game_over):
-                # A worker that died mid-search reports None (see the traceback
-                # handler in persistent_worker). Without this the series stops
-                # here: nothing reschedules, and nothing says so.
-                print(f"ABORTED GAME (engine returned no move). FEN: {self.get_current_fen()}")
-                self.game_over   = True
+            if self.game_mode.get() == GameMode.AI_VS_AI.value and self.ai_series_running:
+                self.game_over = True
                 self.game_result = ('aborted', None)
                 self.update_ui_after_state_change()
                 self._stop_ai_process()
                 self.process_ai_series_result()
                 return
-            
         self._stop_ai_process()
         self.update_bot_labels()
         self.set_interactivity(True)
@@ -1152,22 +1095,6 @@ class EnhancedChessApp:
             return
         promo = promo_cls if promo_cls is not None else Queen
         self.board.make_move(start_pos, end_pos, promo)
-
-    def run_move_checker(self):
-        depth = int(self.bot_depth_slider.get())
-        # Compare the actual board arrangement, not just castling/turn flags.
-        # The old check falsely matched Kiwipete (KQkq, white to move, no ep).
-        is_start_pos = (self.get_current_fen().split()[0] ==
-                        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR")
-        
-        launch_move_checker_dialog(
-            self.master, 
-            self.board.clone(), 
-            self.turn, 
-            depth, 
-            self.COLORS, 
-            is_start_pos
-        )
 
     def on_right_click_start(self, event):
         if self.premove:
@@ -1524,19 +1451,6 @@ class EnhancedChessApp:
                     else:
                         self.tt_fullness_label.config(text="")
 
-                    if self.auto_save_stats_var.get() and self.game_mode.get() == GameMode.AI_VS_AI.value:
-                        m = re.search(
-                            r'>\s*(.*?)\s*\(D(\d+|TB)\):.*?Eval[=:]\s*([+-]?[\d.]+).*?'
-                            r'Nodes(?:Total)?[=:]\s*(\d+).*?KNPS[=:]\s*([\d.]+).*?Time[=:]\s*([\d.]+)s',
-                            msg[1])
-                        if m:
-                            self._pending_move_stat[m.group(1)] = {
-                                'depth': m.group(2),
-                                'eval':  float(m.group(3)),
-                                'nodes': int(m.group(4)),
-                                'knps':  float(m.group(5)),
-                                'time':  float(m.group(6)),
-                            }
                 elif kind == 'eval':
                     self.last_eval_score, self.last_eval_depth = msg[1], msg[2]
                     if self._analysis_output_enabled():
@@ -1547,10 +1461,6 @@ class EnhancedChessApp:
                         self._render_pv()
                 elif kind == 'move':
                     if self.active_worker_name is not None and msg_task_id == self.current_task_id:
-                        if self.auto_save_stats_var.get() and self.game_mode.get() == GameMode.AI_VS_AI.value:
-                            for bot, stat in self._pending_move_stat.items():
-                                self.move_stats.setdefault(bot, []).append(stat)
-                            self._pending_move_stat.clear()
                         self.active_worker_name = None
                         self.analysis_thinking  = False
                         self._execute_ai_move(msg[1])
@@ -1918,6 +1828,142 @@ class EnhancedChessApp:
     def go_to_start(self): self._navigate_history(0)
     def go_to_end(self):   self._navigate_history(len(self.full_history) - 1)
 
+    def _generate_series_opening(self, num_plies=2):
+        """Return one random opening used by both colour-swapped games in a pair."""
+        opening = []
+        board = Board()
+        turn = "white"
+        for _ in range(num_plies):
+            moves = get_all_legal_moves(board, turn)
+            if not moves:
+                break
+            move = random.choice(moves)
+            opening.append(move)
+            promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+            board.make_move(move[0], move[1], promo)
+            turn = "black" if turn == "white" else "white"
+        return opening
+
+    def _series_elo_text(self):
+        values = self._series_elo_values()
+        if values is None:
+            scored_games = (self.ai_series_stats['my_ai_wins'] + self.ai_series_stats['draws'] +
+                            self.ai_series_stats['op_ai_wins'])
+            return ("Elo: waiting for 2 completed games" if scored_games < 2
+                    else "Elo: pending (all scored results are one-sided)")
+        score, elo, elo_error = values
+        return f"Score: {score:.3f}  |  Elo: {elo:+.1f} ± {elo_error:.1f} (95% CI)"
+
+    def _series_elo_values(self):
+        stats = self.ai_series_stats
+        wins, draws, losses = stats['my_ai_wins'], stats['draws'], stats['op_ai_wins']
+        games = wins + draws + losses
+        if games < 2:
+            return None
+
+        score = (wins + 0.5 * draws) / games
+        if score <= 0.0 or score >= 1.0:
+            return None
+
+        # The observed outcome is 0 (loss), 0.5 (draw), or 1 (win), not a
+        # binomial win/loss result.  Use that distribution's score variance so
+        # draws contribute their real, smaller spread to the Elo confidence
+        # interval instead of being treated as half a win and half a loss.
+        p_win = wins / games
+        p_draw = draws / games
+        score_variance = (p_win + 0.25 * p_draw - score * score) / games
+        if score_variance <= 0.0:
+            return None
+
+        elo = 400.0 * math.log10(score / (1.0 - score))
+        elo_error = (1.96 * (400.0 / math.log(10.0)) * math.sqrt(score_variance) /
+                     (score * (1.0 - score)))
+        return score, elo, elo_error
+
+    def save_ai_series_results(self):
+        """Write a tab-separated snapshot for copying into the results workbook."""
+        stats = self.ai_series_stats
+        values = self._series_elo_values()
+        scored_games = stats['my_ai_wins'] + stats['draws'] + stats['op_ai_wins']
+        mode = (f"Clock ({int(self.time_control_seconds.get())}s + {self.increment:.1f}s inc)"
+                if self.use_clock_var.get() else f"Fixed depth {self.bot_depth_slider.get()}")
+        score = f"{values[0]:.6f}" if values else "pending"
+        elo = f"{values[1]:+.2f}" if values else "pending"
+        margin = f"{values[2]:.2f}" if values else "pending"
+        output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AI_Series_Results.txt")
+
+        try:
+            with open(output_path, "w", encoding="utf-8", newline="") as output:
+                output.write(f"AI Series Results\t{mode}\t{stats['game_count']} / {self.AI_SERIES_GAMES} games\n")
+                output.write("Candidate\tBaseline\tWins\tDraws\tLosses\tScored Games\tScore\tElo\t95% Elo Margin\tAborts\n")
+                output.write(
+                    f"{self.MAIN_AI_NAME}\t{self.OPPONENT_AI_NAME}\t"
+                    f"{stats['my_ai_wins']}\t{stats['draws']}\t{stats['op_ai_wins']}\t"
+                    f"{scored_games}\t{score}\t{elo}\t{margin}\t{stats.get('aborts', 0)}\n"
+                )
+        except OSError as error:
+            print(f"Failed to write AI series results: {error}")
+
+    def process_ai_series_result(self):
+        self.ai_series_stats['game_count'] += 1
+        result, winner = self.game_result
+        if result == 'aborted':
+            self.ai_series_stats['aborts'] = self.ai_series_stats.get('aborts', 0) + 1
+        elif winner:
+            main_color = 'white' if self.white_playing_bot_type == 'main' else 'black'
+            key = 'my_ai_wins' if winner == main_color else 'op_ai_wins'
+            self.ai_series_stats[key] += 1
+        else:
+            self.ai_series_stats['draws'] += 1
+
+        self.save_ai_series_results()
+        self.update_scoreboard()
+        if self.ai_series_running and self.ai_series_stats['game_count'] < self.AI_SERIES_GAMES:
+            self.master.after(1000, self.reset_game)
+        else:
+            self.ai_series_running = False
+            self.turn_label.config(text="AI SERIES COMPLETE!")
+
+    def start_ai_series(self):
+        self._stop_ai_process()
+        self.game_mode.set(GameMode.AI_VS_AI.value)
+        self.ai_series_stats = {'game_count': 0, 'my_ai_wins': 0, 'op_ai_wins': 0, 'draws': 0}
+        self.current_opening_sequence = []
+        self.ai_series_running = True
+        self.save_ai_series_results()
+        self.update_scoreboard()
+        self.reset_game()
+
+    def apply_series_opening_move(self):
+        if self.ai_series_stats['game_count'] % 2 == 0:
+            self.current_opening_sequence = self._generate_series_opening()
+
+        self._pause_clock()
+        for move in self.current_opening_sequence:
+            promo = move[2] if len(move) > 2 and move[2] is not None else Queen
+            self.board.make_move(move[0], move[1], promo)
+            self.execute_move_and_check_state(self.turn, move)
+            if self.game_over:
+                return
+        self.last_clock_tick = time.time()
+        self.clock_running = False
+
+    def update_scoreboard(self):
+        if not (self.game_mode.get() == GameMode.AI_VS_AI.value and self.ai_series_running):
+            self.scoreboard_label.config(text="")
+            return
+
+        stats = self.ai_series_stats
+        text = (
+            f"{self.MAIN_AI_NAME} vs {self.OPPONENT_AI_NAME} "
+            f"({stats['game_count']}/{self.AI_SERIES_GAMES} games)\n"
+            f"W: {stats['my_ai_wins']}  D: {stats['draws']}  L: {stats['op_ai_wins']}\n"
+            f"{self._series_elo_text()}"
+        )
+        if stats.get('aborts'):
+            text += f"  |  Aborts: {stats['aborts']}"
+        self.scoreboard_label.config(text=text)
+
     def update_navigation_buttons(self):
         if self.game_mode.get() == GameMode.AI_VS_AI.value:
             for b in (self.start_button, self.undo_button, self.redo_button, self.end_button):
@@ -1929,83 +1975,6 @@ class EnhancedChessApp:
         self.undo_button .config(state=tk.NORMAL if can_back else tk.DISABLED)
         self.redo_button .config(state=tk.NORMAL if can_fwd  else tk.DISABLED)
         self.end_button  .config(state=tk.NORMAL if can_fwd  else tk.DISABLED)
-
-    def process_ai_series_result(self):
-        self.ai_series_stats['game_count'] += 1
-        res, wc = self.game_result
-        if res == 'aborted':
-            # Kept out of the draw column so a crashed worker cannot quietly
-            # launder itself into the Elo calculation.
-            self.ai_series_stats['aborts'] = self.ai_series_stats.get('aborts', 0) + 1
-        elif wc:
-            main_color = 'white' if self.white_playing_bot_type == 'main' else 'black'
-            self.ai_series_stats['my_ai_wins' if wc == main_color else 'op_ai_wins'] += 1
-        else:
-            self.ai_series_stats['draws'] += 1
-        self.update_scoreboard()
-        if self.auto_save_stats_var.get():
-            self.save_depth_stats_to_file()
-        if self.ai_series_running and self.ai_series_stats['game_count'] < self.AI_SERIES_GAMES:
-            self.master.after(1000, self.reset_game)
-        else:
-            self.ai_series_running = False
-            self.turn_label.config(text="AI SERIES COMPLETE!")
-
-    def start_ai_series(self):
-        self._stop_ai_process()
-        self.game_mode.set(GameMode.AI_VS_AI.value)
-        self.ai_series_stats          = {'game_count': 0, 'my_ai_wins': 0, 'op_ai_wins': 0, 'draws': 0}
-        self.move_stats               = {}
-        self._pending_move_stat       = {}
-        self.ai_series_running        = True
-        self.current_opening_sequence = []
-        self.update_scoreboard()
-        self.reset_game()
-
-    def apply_series_opening_move(self):
-        if self.ai_series_stats['game_count'] % 2 == 0:
-            print("\n--- Generating new 2-ply opening sequence ---")
-            self.current_opening_sequence = generate_series_opening_sequence(self.board, num_plies=2)
-        self._pause_clock()
-        for move in self.current_opening_sequence:
-            child = self.board.clone()
-            promo = move[2] if len(move) > 2 and move[2] is not None else Queen
-            child.make_move(move[0], move[1], promo)
-            print(f"Opening: {format_move_san(self.board, child, move)}")
-            self.board.make_move(move[0], move[1], promo)
-            self.execute_move_and_check_state(self.turn, move)
-            if self.game_over:
-                break
-        self.last_clock_tick = time.time()
-        self.clock_running   = False
-
-    def update_scoreboard(self):
-        if self.game_mode.get() == GameMode.AI_VS_AI.value and self.ai_series_running:
-            s = self.ai_series_stats
-            self.scoreboard_label.config(text=(
-                f"{self.MAIN_AI_NAME} vs {self.OPPONENT_AI_NAME} "
-                f"({s['game_count']}/{self.AI_SERIES_GAMES} games)\n"
-                f"  {self.MAIN_AI_NAME}: {s['my_ai_wins']}  "
-                f"{self.OPPONENT_AI_NAME}: {s['op_ai_wins']}  Draws: {s['draws']}"
-                + (f"  Aborts: {s['aborts']}" if s.get('aborts') else "")))
-        else:
-            self.scoreboard_label.config(text="")
-
-    def save_depth_stats_to_file(self):
-        import os
-        out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AI_Series_Results.txt")
-        write_series_stats_file(
-            out_path=out_path,
-            move_stats=self.move_stats,
-            series_stats=self.ai_series_stats,
-            main_name=self.MAIN_AI_NAME,
-            op_name=self.OPPONENT_AI_NAME,
-            use_clock=self.use_clock_var.get(),
-            time_control_sec=self.time_control_seconds.get(),
-            increment=self.increment,
-            fixed_depth=self.bot_depth_slider.get(),
-            total_series_games=self.AI_SERIES_GAMES,
-        )
 
     def _on_pv_text_motion(self, event):
         index = self.pv_text.index(f"@{event.x},{event.y}")

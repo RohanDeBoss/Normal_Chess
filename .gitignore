@@ -1,3 +1,5 @@
-_pycache_
-*.pyc
-/__pycache__
+__pycache__/
+*.py[cod]
+.vscode/
+AI_Series_Results.txt
+bench_results.json

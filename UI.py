@@ -8,6 +8,7 @@ import time
 import re
 import traceback
 import os
+from statistics import NormalDist
 from GameLogic import *
 from AI import ChessBot, board_hash
 from OpponentAI import OpponentAI
@@ -32,7 +33,8 @@ class EnhancedChessApp:
     ANALYSIS_AI_NAME = "Analysis"
     slidermaxvalue   = 15
     MAX_GAME_MOVES   = None  # Standard chess rules: no artificial move limit
-    AI_SERIES_GAMES  = 500
+    AI_SERIES_DEFAULT_GAMES = 1000
+    AI_SERIES_MIN_CONFIDENCE_GAMES = 10
 
     def __init__(self, master):
         self.master = master
@@ -85,6 +87,11 @@ class EnhancedChessApp:
         self.ai_series_running   = False
         self.ai_series_stats     = {'game_count': 0, 'my_ai_wins': 0, 'op_ai_wins': 0, 'draws': 0}
         self.current_opening_sequence = []
+        self.ai_series_use_max_games = tk.BooleanVar(value=True)
+        self.ai_series_max_games = tk.IntVar(value=self.AI_SERIES_DEFAULT_GAMES)
+        self.ai_series_use_confidence = tk.BooleanVar(value=True)
+        self.ai_series_confidence = tk.DoubleVar(value=95.0)
+        self.ai_series_completion_reason = None
         self.show_pv_var          = tk.BooleanVar(value=True)
         self.long_notation_var    = tk.BooleanVar(value=False)
         self.instant_move         = tk.BooleanVar(value=False)
@@ -370,6 +377,21 @@ class EnhancedChessApp:
                                          highlightthickness=0, relief='flat')
         self.bot_depth_slider.set(ChessBot.search_depth)
         self.bot_depth_slider.pack(fill=tk.X, pady=(0, 3))
+
+        ttk.Label(cf, text="AI Series Stop:", style='SmallHeader.TLabel').pack(anchor=tk.W, pady=(5, 0))
+        series_stop_frame = ttk.Frame(cf, style='Left.TFrame')
+        series_stop_frame.pack(fill=tk.X, pady=(0, 3))
+        ttk.Checkbutton(series_stop_frame, text="Max games",
+                        variable=self.ai_series_use_max_games,
+                        style='Custom.TCheckbutton').grid(row=0, column=0, sticky=tk.W)
+        ttk.Spinbox(series_stop_frame, from_=2, to=100000, increment=2,
+                    textvariable=self.ai_series_max_games, width=7).grid(row=0, column=1, padx=(4, 0))
+        ttk.Checkbutton(series_stop_frame, text="Confidence",
+                        variable=self.ai_series_use_confidence,
+                        style='Custom.TCheckbutton').grid(row=1, column=0, sticky=tk.W)
+        ttk.Spinbox(series_stop_frame, from_=50.0, to=99.9, increment=0.5,
+                    textvariable=self.ai_series_confidence, width=7).grid(row=1, column=1, padx=(4, 0))
+        ttk.Label(series_stop_frame, text="%", style='SmallHeader.TLabel').grid(row=1, column=2, sticky=tk.W)
 
         for text, var, cmd in [
             ("Use Opening Book",           self.use_opening_book_var, None),
@@ -1852,7 +1874,12 @@ class EnhancedChessApp:
             return ("Elo: waiting for 2 completed games" if scored_games < 2
                     else "Elo: pending (all scored results are one-sided)")
         score, elo, elo_error = values
-        return f"Score: {score:.3f}  |  Elo: {elo:+.1f} ± {elo_error:.1f} (95% CI)"
+        confidence = self._series_confidence()
+        confidence_text = ""
+        if confidence:
+            probability, stronger_name = confidence
+            confidence_text = f"  |  {stronger_name} stronger: {probability:.1%}"
+        return f"Score: {score:.3f}  |  Elo: {elo:+.1f} ± {elo_error:.1f} (95% CI){confidence_text}"
 
     def _series_elo_values(self):
         stats = self.ai_series_stats
@@ -1880,6 +1907,70 @@ class EnhancedChessApp:
                      (score * (1.0 - score)))
         return score, elo, elo_error
 
+    def _series_confidence(self):
+        """Return normal-approximate evidence for whichever engine leads."""
+        values = self._series_elo_values()
+        if values is None:
+            return None
+
+        _, elo, elo_error_95 = values
+        elo_standard_error = elo_error_95 / 1.96
+        if elo_standard_error <= 0.0:
+            return None
+
+        candidate_probability = NormalDist().cdf(elo / elo_standard_error)
+        if candidate_probability >= 0.5:
+            return candidate_probability, self.MAIN_AI_NAME
+        return 1.0 - candidate_probability, self.OPPONENT_AI_NAME
+
+    def _series_max_games_limit(self):
+        """Return a safe, even game limit so colour-swapped pairs stay intact."""
+        try:
+            max_games = int(self.ai_series_max_games.get())
+        except (tk.TclError, TypeError, ValueError):
+            max_games = self.AI_SERIES_DEFAULT_GAMES
+        max_games = max(2, max_games)
+        return max_games if max_games % 2 == 0 else max_games + 1
+
+    def _series_confidence_threshold(self):
+        """Return a valid confidence threshold even while its spinbox is edited."""
+        try:
+            threshold = float(self.ai_series_confidence.get())
+        except (tk.TclError, TypeError, ValueError):
+            threshold = 95.0
+        if not math.isfinite(threshold):
+            threshold = 95.0
+        return min(99.9, max(50.0, threshold)) / 100.0
+
+    def _series_stop_reason(self):
+        # Each opening is played twice with the engines' colours reversed.  Do
+        # not let either criterion stop midway through that matched pair.
+        if self.ai_series_stats['game_count'] % 2:
+            return None
+
+        if self.ai_series_use_max_games.get():
+            max_games = self._series_max_games_limit()
+            if self.ai_series_stats['game_count'] >= max_games:
+                return f"maximum of {max_games} games reached"
+
+        if self.ai_series_use_confidence.get():
+            scored_games = (self.ai_series_stats['my_ai_wins'] + self.ai_series_stats['draws'] +
+                            self.ai_series_stats['op_ai_wins'])
+            confidence = self._series_confidence()
+            threshold = self._series_confidence_threshold()
+            if scored_games >= self.AI_SERIES_MIN_CONFIDENCE_GAMES and confidence and confidence[0] >= threshold:
+                return f"{confidence[1]} stronger at {confidence[0]:.1%} confidence"
+        return None
+
+    def _series_stop_description(self):
+        limits = []
+        if self.ai_series_use_max_games.get():
+            limits.append(f"Max games: {self._series_max_games_limit()}")
+        if self.ai_series_use_confidence.get():
+            threshold = self._series_confidence_threshold() * 100.0
+            limits.append(f"Confidence: {threshold:.1f}% (minimum {self.AI_SERIES_MIN_CONFIDENCE_GAMES} scored games)")
+        return "  |  ".join(limits) if limits else "No limit"
+
     def save_ai_series_results(self):
         """Write a tab-separated snapshot for copying into the results workbook."""
         stats = self.ai_series_stats
@@ -1894,12 +1985,13 @@ class EnhancedChessApp:
 
         try:
             with open(output_path, "w", encoding="utf-8", newline="") as output:
-                output.write(f"AI Series Results\t{mode}\t{stats['game_count']} / {self.AI_SERIES_GAMES} games\n")
-                output.write("Candidate\tBaseline\tWins\tDraws\tLosses\tScored Games\tScore\tElo\t95% Elo Margin\tAborts\n")
+                output.write(f"AI Series Results\t{mode}\t{self._series_stop_description()}\n")
+                output.write("Candidate\tBaseline\tGames\tWins\tDraws\tLosses\tScored Games\tScore\tElo\t95% Elo Margin\tAborts\tEnd Reason\n")
                 output.write(
                     f"{self.MAIN_AI_NAME}\t{self.OPPONENT_AI_NAME}\t"
-                    f"{stats['my_ai_wins']}\t{stats['draws']}\t{stats['op_ai_wins']}\t"
-                    f"{scored_games}\t{score}\t{elo}\t{margin}\t{stats.get('aborts', 0)}\n"
+                    f"{stats['game_count']}\t{stats['my_ai_wins']}\t{stats['draws']}\t"
+                    f"{stats['op_ai_wins']}\t{scored_games}\t{score}\t{elo}\t{margin}\t"
+                    f"{stats.get('aborts', 0)}\t{self.ai_series_completion_reason or 'running'}\n"
                 )
         except OSError as error:
             print(f"Failed to write AI series results: {error}")
@@ -1916,13 +2008,17 @@ class EnhancedChessApp:
         else:
             self.ai_series_stats['draws'] += 1
 
-        self.save_ai_series_results()
-        self.update_scoreboard()
-        if self.ai_series_running and self.ai_series_stats['game_count'] < self.AI_SERIES_GAMES:
+        stop_reason = self._series_stop_reason()
+        if self.ai_series_running and stop_reason is None:
+            self.save_ai_series_results()
+            self.update_scoreboard()
             self.master.after(1000, self.reset_game)
         else:
             self.ai_series_running = False
-            self.turn_label.config(text="AI SERIES COMPLETE!")
+            self.ai_series_completion_reason = stop_reason or "series stopped"
+            self.save_ai_series_results()
+            self.update_scoreboard()
+            self.turn_label.config(text=f"AI SERIES COMPLETE: {self.ai_series_completion_reason.upper()}")
 
     def start_ai_series(self):
         self._stop_ai_process()
@@ -1930,6 +2026,7 @@ class EnhancedChessApp:
         self.ai_series_stats = {'game_count': 0, 'my_ai_wins': 0, 'op_ai_wins': 0, 'draws': 0}
         self.current_opening_sequence = []
         self.ai_series_running = True
+        self.ai_series_completion_reason = None
         self.save_ai_series_results()
         self.update_scoreboard()
         self.reset_game()
@@ -1949,19 +2046,22 @@ class EnhancedChessApp:
         self.clock_running = False
 
     def update_scoreboard(self):
-        if not (self.game_mode.get() == GameMode.AI_VS_AI.value and self.ai_series_running):
+        if not (self.game_mode.get() == GameMode.AI_VS_AI.value and
+                (self.ai_series_running or self.ai_series_completion_reason)):
             self.scoreboard_label.config(text="")
             return
 
         stats = self.ai_series_stats
         text = (
             f"{self.MAIN_AI_NAME} vs {self.OPPONENT_AI_NAME} "
-            f"({stats['game_count']}/{self.AI_SERIES_GAMES} games)\n"
+            f"({stats['game_count']} games; {self._series_stop_description()})\n"
             f"W: {stats['my_ai_wins']}  D: {stats['draws']}  L: {stats['op_ai_wins']}\n"
             f"{self._series_elo_text()}"
         )
         if stats.get('aborts'):
             text += f"  |  Aborts: {stats['aborts']}"
+        if self.ai_series_completion_reason:
+            text += f"\nStopped: {self.ai_series_completion_reason}"
         self.scoreboard_label.config(text=text)
 
     def update_navigation_buttons(self):

@@ -433,6 +433,7 @@ class OpponentAI:
 
     def ponder_indefinitely(self):
         try:
+            ponder_start_time = time.time()
             self.stop_time = None
             self._age_history_table()
             if is_insufficient_material(self.board): return
@@ -461,7 +462,7 @@ class OpponentAI:
 
                     eval_for_ui = best_score_this_iter if self.color == 'white' else -best_score_this_iter
                     tt_str = f", TT={int((self.tt_filled / self.TT_SIZE) * 1000)}/1000" if getattr(self, 'show_tt_fullness', False) else ""
-                    self._report_log(f"  > {self.bot_name} (D{current_depth}): {self._format_move(self.board, best_move_this_iter)}, Eval={eval_for_ui/100:+.2f}, NodesTotal={total_nodes}, KNPS={knps:.1f}{tt_str}, Time={iter_duration:.2f}s")
+                    self._report_log(f"  > {self.bot_name} (D{current_depth}): {self._format_move(self.board, best_move_this_iter)}, Eval={eval_for_ui/100:+.2f}, NodesTotal={total_nodes}, KNPS={knps:.1f}{tt_str}, Time={time.time() - ponder_start_time:.2f}s, Iter={iter_duration:.2f}s")
                     self._report_eval(best_score_this_iter, current_depth)
 
                     pv_str, pv_raw = self._get_pv_data(current_depth, best_move_this_iter)

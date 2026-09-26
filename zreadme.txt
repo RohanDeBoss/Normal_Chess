@@ -37,7 +37,7 @@ next colour-swapped game, and displays live W/D/L, score, Elo, and a 95%
 confidence margin in the sidebar. No concurrent match games are used.
 
 Under **AI Series Stop**, the **Max games** and **Confidence** checkboxes work
-independently. By default both are enabled: 1,000 games and 95% confidence.
+independently. By default both are enabled: 1,000 games and 98% confidence.
 The series stops as soon as either enabled limit is reached, but only after a
 complete colour-swapped pair of games. This ensures neither AI gains an
 unmatched White-game advantage. An odd maximum entered manually is rounded up
@@ -45,10 +45,11 @@ to the next even number. Untick either limit to ignore it; untick both for an
 unlimited series.
 
 Confidence mode needs at least 10 scored games, then stops once the
-normal-approximate evidence reaches the selected percentage that either AI.py
-or OpponentAI.py is stronger. This prevents an inconclusive series from running
-forever when the candidate is weaker. Like the game limit, confidence is only
-checked after a complete pair.
+one-sided pair-aware match-score estimate reaches the selected percentage that
+either AI.py or OpponentAI.py is stronger. Each colour-swapped opening pair is
+one statistical observation, so opening-specific results are not incorrectly
+counted as two independent pieces of evidence. Like the game limit,
+confidence is only checked after a complete pair.
 
 AI.py is the candidate engine and OpponentAI.py is the baseline. When a
 candidate is convincingly stronger, copying it into OpponentAI.py is intentional

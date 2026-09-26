@@ -34,7 +34,10 @@ class EnhancedChessApp:
     slidermaxvalue   = 15
     MAX_GAME_MOVES   = None  # Standard chess rules: no artificial move limit
     AI_SERIES_DEFAULT_GAMES = 1000
-    AI_SERIES_MIN_CONFIDENCE_GAMES = 10
+    AI_SERIES_DEFAULT_CONFIDENCE = 98.0
+    _SEARCH_LOG_RE = re.compile(
+        r'\(D(?P<depth>\d+)\):.*?NodesTotal=(?P<nodes>\d+), KNPS=(?P<knps>[\d.]+).*?Time=(?P<time>[\d.]+)s'
+    )
 
     def __init__(self, master):
         self.master = master
@@ -86,15 +89,17 @@ class EnhancedChessApp:
         self.analysis_mode_var   = tk.BooleanVar(value=True)
         self.ai_series_running   = False
         self.ai_series_stats     = {'game_count': 0, 'my_ai_wins': 0, 'op_ai_wins': 0, 'draws': 0}
+        self.ai_series_game_scores = []
+        self.ai_series_engine_stats = self._new_series_engine_stats()
+        self._search_task_stats = {}
         self.current_opening_sequence = []
         self.ai_series_use_max_games = tk.BooleanVar(value=True)
         self.ai_series_max_games = tk.IntVar(value=self.AI_SERIES_DEFAULT_GAMES)
         self.ai_series_use_confidence = tk.BooleanVar(value=True)
-        self.ai_series_confidence = tk.DoubleVar(value=95.0)
+        self.ai_series_confidence = tk.DoubleVar(value=self.AI_SERIES_DEFAULT_CONFIDENCE)
         self.ai_series_completion_reason = None
         self.show_pv_var          = tk.BooleanVar(value=True)
         self.long_notation_var    = tk.BooleanVar(value=False)
-        self.instant_move         = tk.BooleanVar(value=False)
         self.use_opening_book_var = tk.BooleanVar(value=True)
         self.show_tt_fullness_var = tk.BooleanVar(value=False)
 
@@ -395,7 +400,6 @@ class EnhancedChessApp:
 
         for text, var, cmd in [
             ("Use Opening Book",           self.use_opening_book_var, None),
-            ("Instant Moves",              self.instant_move,         None),
             ("Analysis Mode (H-vs-H)",     self.analysis_mode_var,    self._update_analysis_after_state_change),
             ("Show Engine Lines (PV)",     self.show_pv_var,          self._render_pv),
             ("Show TT Fullness",           self.show_tt_fullness_var, None),
@@ -414,8 +418,10 @@ class EnhancedChessApp:
         self.turn_label.pack(fill=tk.X, pady=(5, 5))
         self.tt_fullness_label = ttk.Label(info, text="", style='SmallHeader.TLabel')
         self.tt_fullness_label.pack(anchor=tk.W, pady=(2, 2))
-        ttk.Checkbutton(info, text="Use Clock", variable=self.use_clock_var,
-                        command=self._toggle_clock).pack(anchor=tk.W, pady=(2, 2))
+        self.use_clock_checkbutton = ttk.Checkbutton(
+            info, text="Use Clock", variable=self.use_clock_var,
+            command=self._toggle_clock)
+        self.use_clock_checkbutton.pack(anchor=tk.W, pady=(2, 2))
 
         self.clock_frame = ttk.Frame(info, style='Left.TFrame')
         self.clock_frame.pack(fill=tk.X, pady=(5, 5))
@@ -438,6 +444,7 @@ class EnhancedChessApp:
         self.time_control_label.pack(anchor=tk.W)
         self.time_control_slider = tk.Scale(
             self.time_control_frame, from_=10, to=600, orient=tk.HORIZONTAL,
+            resolution=10,
             bg=self.COLORS['bg_dark'], fg=self.COLORS['text_light'],
             highlightthickness=0, relief='flat', showvalue=False,
             variable=self.time_control_seconds,
@@ -455,7 +462,8 @@ class EnhancedChessApp:
 
         self.scoreboard_label = ttk.Label(parent, text="", font=("Helvetica", 11),
                                           justify=tk.LEFT, background=self.COLORS['bg_dark'],
-                                          foreground=self.COLORS['text_light'])
+                                          foreground=self.COLORS['text_light'],
+                                          wraplength=self.base_sidebar_width)
         self.scoreboard_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 5))
 
         ttk.Label(parent, text="Move History", style='SmallHeader.TLabel').pack(side=tk.TOP, anchor=tk.W)
@@ -532,6 +540,13 @@ class EnhancedChessApp:
                       indicatorcolor=[('selected', C['accent'])])
 
         style.configure('TEntry', fieldbackground='#FFFFFF', foreground='#000000', insertcolor='#000000')
+        # Spinboxes use their own ttk style; without this Windows renders the
+        # two AI-series fields as bright white default controls.
+        style.configure('TSpinbox', fieldbackground=C['bg_medium'], background=C['bg_light'],
+                        foreground=C['text_light'], arrowcolor=C['text_light'],
+                        insertcolor=C['text_light'])
+        style.map('TSpinbox', fieldbackground=[('focus', C['bg_medium'])],
+                  foreground=[('disabled', C['text_dark'])])
         return C
 
     def handle_main_resize(self, event):
@@ -539,6 +554,10 @@ class EnhancedChessApp:
         if w != self.left_panel.winfo_width():
             self.left_panel.config(width=w)
             self.right_panel.config(width=w + 20)
+        # The score line includes the active stop criteria and can be longer
+        # than the sidebar.  Wrap it instead of silently clipping its end.
+        if hasattr(self, 'scoreboard_label'):
+            self.scoreboard_label.config(wraplength=max(160, w + 10))
 
     def handle_board_resize(self, event):
         eval_h = max(self.eval_frame.winfo_height(), self.eval_frame.winfo_reqheight())
@@ -617,10 +636,10 @@ class EnhancedChessApp:
         if mode == GameMode.HUMAN_VS_BOT.value:
             self.board_orientation = self.human_color
             if not self.game_over and self.turn != self.human_color:
-                self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
+                self.master.after(0, self._make_game_ai_move)
         elif mode == GameMode.AI_VS_AI.value:
             if not self.game_over:
-                self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
+                self.master.after(0, self._make_game_ai_move)
         elif mode == GameMode.HUMAN_VS_HUMAN.value:
             self.board_orientation = "white"
             self._update_analysis_after_state_change()
@@ -637,7 +656,7 @@ class EnhancedChessApp:
             self.update_ui_after_state_change()
             if not self.game_over and self.turn != self.human_color:
                 print(f"Swapped sides. AI ({self.turn}) taking over...")
-                self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
+                self.master.after(0, self._make_game_ai_move)
 
     def _reset_game_state_vars(self):
         self.full_history    = [(self.board.clone(), self.turn, None)]
@@ -697,7 +716,7 @@ class EnhancedChessApp:
         self._update_analysis_after_state_change()
         if not self.game_over and self.game_mode.get() == GameMode.HUMAN_VS_BOT.value \
                 and self.turn != self.human_color:
-            self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
+            self.master.after(0, self._make_game_ai_move)
 
     def get_current_pgn(self):
         return generate_pgn(self.full_history, self.game_result, self.san_history)
@@ -863,12 +882,12 @@ class EnhancedChessApp:
                         self.execute_move_and_check_state(self.turn, (start_pos, end_pos, promo_cls))
                         if not self.game_over and self.turn != self.human_color:
                             self.set_interactivity(False)
-                            self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
+                            self.master.after(0, self._make_game_ai_move)
                     else:
                         self.draw_board()
 
             if not self.game_over and self.game_mode.get() == GameMode.AI_VS_AI.value:
-                self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
+                self.master.after(0, self._make_game_ai_move)
         else:
             print("AI reported no valid move.")
             if self.game_mode.get() == GameMode.AI_VS_AI.value and self.ai_series_running:
@@ -1050,7 +1069,7 @@ class EnhancedChessApp:
                     self.valid_moves = []
                     self.valid_moves_for_highlight = []
                     self.set_interactivity(False)
-                    self.master.after(self._get_ai_move_delay(), self._make_game_ai_move)
+                    self.master.after(0, self._make_game_ai_move)
                     return
                 elif mode == GameMode.HUMAN_VS_HUMAN.value:
                     self._update_analysis_after_state_change()
@@ -1219,7 +1238,7 @@ class EnhancedChessApp:
         self.fen_entry.delete(0, tk.END)
         self.pgn_entry.delete(0, tk.END)
         self.game_started = True
-        mode, delay = self.game_mode.get(), self._get_ai_move_delay()
+        mode = self.game_mode.get()
         if mode == GameMode.AI_VS_AI.value:
             self.white_playing_bot_type = "op" if (
                 self.ai_series_running and self.ai_series_stats['game_count'] % 2 == 1) else "main"
@@ -1227,11 +1246,11 @@ class EnhancedChessApp:
             if self.ai_series_running:
                 self.apply_series_opening_move()
             if not self.game_over and schedule_ai:
-                self.master.after(delay, self._make_game_ai_move)
+                self.master.after(0, self._make_game_ai_move)
         elif mode == GameMode.HUMAN_VS_BOT.value:
             self.board_orientation = self.human_color
             if self.turn != self.human_color and schedule_ai:
-                self.master.after(delay, self._make_game_ai_move)
+                self.master.after(0, self._make_game_ai_move)
         else:
             self.board_orientation = "white"
         self.update_ui_after_state_change()
@@ -1467,6 +1486,7 @@ class EnhancedChessApp:
                     continue
                 if kind == 'log':
                     print(msg[1])
+                    self._capture_search_log(msg_task_id, msg[1])
                     tt_m = re.search(r'TT=(\d+/1000)', msg[1])
                     if tt_m and self.show_tt_fullness_var.get():
                         self.tt_fullness_label.config(text=f"TT Occupancy: {tt_m.group(1)}")
@@ -1483,6 +1503,7 @@ class EnhancedChessApp:
                         self._render_pv()
                 elif kind == 'move':
                     if self.active_worker_name is not None and msg_task_id == self.current_task_id:
+                        self._record_series_search_stats(msg_task_id)
                         self.active_worker_name = None
                         self.analysis_thinking  = False
                         self._execute_ai_move(msg[1])
@@ -1535,6 +1556,11 @@ class EnhancedChessApp:
         inc = (self.increment if self.use_clock_var.get() else None) if not is_analysis else None
 
         self.current_task_id += 1
+        if self.game_mode.get() == GameMode.AI_VS_AI.value and self.ai_series_running:
+            self._search_task_stats[self.current_task_id] = {
+                'engine': 'main' if bot_class is ChessBot else 'op',
+                'depth': -1,
+            }
 
         task = {
             'board':            self.board.clone(),
@@ -1567,6 +1593,48 @@ class EnhancedChessApp:
         if not self.analysis_thinking:
             self.set_interactivity(False)
         self.update_bot_labels()
+
+    @staticmethod
+    def _new_series_engine_stats():
+        return {
+            key: {'moves': 0, 'depth_sum': 0.0, 'depth_max': 0,
+                  'nodes_sum': 0, 'time_sum': 0.0, 'time_max': 0.0,
+                  'knps_sum': 0.0}
+            for key in ('main', 'op')
+        }
+
+    def _capture_search_log(self, task_id, message):
+        """Keep the deepest completed iteration for each active engine move."""
+        pending = self._search_task_stats.get(task_id)
+        if pending is None:
+            return
+        match = self._SEARCH_LOG_RE.search(message)
+        if match is None:
+            return
+        depth = int(match['depth'])
+        if depth < pending['depth']:
+            return
+        pending.update(
+            depth=depth,
+            nodes=int(match['nodes']),
+            knps=float(match['knps']),
+            time=float(match['time']),
+        )
+
+    def _record_series_search_stats(self, task_id):
+        pending = self._search_task_stats.pop(task_id, None)
+        if (pending is None or pending['depth'] < 0 or
+                not self.ai_series_running or
+                self.game_mode.get() != GameMode.AI_VS_AI.value):
+            return
+        stats = self.ai_series_engine_stats[pending['engine']]
+        stats['moves'] += 1
+        stats['depth_sum'] += pending['depth']
+        stats['depth_max'] = max(stats['depth_max'], pending['depth'])
+        stats['nodes_sum'] += pending['nodes']
+        stats['time_sum'] += pending['time']
+        stats['time_max'] = max(stats['time_max'], pending['time'])
+        stats['knps_sum'] += pending['knps']
 
     def _stop_ai_process(self, drain_queue=True, invalidate_task=True):
         if self.active_worker_name == 'main':
@@ -1618,7 +1686,11 @@ class EnhancedChessApp:
 
     def _toggle_clock(self):
         if self.use_clock_var.get():
-            self.clock_frame.pack(after=self.turn_label, fill=tk.X, pady=(5, 5))
+            # Re-pack the whole group in display order.  reset_game() calls
+            # this repeatedly, and packing only the later frames after the
+            # turn label used to move them above the Use Clock checkbox.
+            self.use_clock_checkbutton.pack(after=self.turn_label, anchor=tk.W, pady=(2, 2))
+            self.clock_frame.pack(after=self.use_clock_checkbutton, fill=tk.X, pady=(5, 5))
             self.time_control_frame.pack(after=self.clock_frame, fill=tk.X, pady=(5, 5))
             self._update_time_control_label()
             self.render_clocks()
@@ -1629,9 +1701,6 @@ class EnhancedChessApp:
             self.time_control_frame.pack_forget()
             self._pause_clock()
             self.last_clock_tick = None
-
-    def _get_ai_move_delay(self):
-        return 0 if self.use_clock_var.get() else (4 if self.instant_move.get() else 20)
 
     def render_clocks(self):
         if not self.use_clock_var.get():
@@ -1869,36 +1938,32 @@ class EnhancedChessApp:
     def _series_elo_text(self):
         values = self._series_elo_values()
         if values is None:
-            scored_games = (self.ai_series_stats['my_ai_wins'] + self.ai_series_stats['draws'] +
-                            self.ai_series_stats['op_ai_wins'])
-            return ("Elo: waiting for 2 completed games" if scored_games < 2
-                    else "Elo: pending (all scored results are one-sided)")
-        score, elo, elo_error = values
+            text = "Elo: pending"
+        else:
+            score, elo, elo_error = values
+            text = f"Elo: {elo:+.0f} ± {elo_error:.0f}"
         confidence = self._series_confidence()
-        confidence_text = ""
         if confidence:
             probability, stronger_name = confidence
-            confidence_text = f"  |  {stronger_name} stronger: {probability:.1%}"
-        return f"Score: {score:.3f}  |  Elo: {elo:+.1f} ± {elo_error:.1f} (95% CI){confidence_text}"
+            text += f"  •  Chance: {stronger_name} {probability:.0%}"
+        return text
 
     def _series_elo_values(self):
-        stats = self.ai_series_stats
-        wins, draws, losses = stats['my_ai_wins'], stats['draws'], stats['op_ai_wins']
-        games = wins + draws + losses
-        if games < 2:
+        pair_scores = self._series_pair_scores()
+        pairs = len(pair_scores)
+        if pairs < 2:
             return None
 
-        score = (wins + 0.5 * draws) / games
+        # Each score is the candidate's result across a colour-swapped opening
+        # pair (0, 0.5, ..., 2).  Treating the two games as independent makes
+        # the confidence too optimistic when that opening favours one side.
+        pair_mean = sum(pair_scores) / pairs
+        score = pair_mean / 2.0
         if score <= 0.0 or score >= 1.0:
             return None
 
-        # The observed outcome is 0 (loss), 0.5 (draw), or 1 (win), not a
-        # binomial win/loss result.  Use that distribution's score variance so
-        # draws contribute their real, smaller spread to the Elo confidence
-        # interval instead of being treated as half a win and half a loss.
-        p_win = wins / games
-        p_draw = draws / games
-        score_variance = (p_win + 0.25 * p_draw - score * score) / games
+        score_variance = sum((pair_score / 2.0 - score) ** 2
+                             for pair_score in pair_scores) / (pairs * (pairs - 1))
         if score_variance <= 0.0:
             return None
 
@@ -1907,21 +1972,12 @@ class EnhancedChessApp:
                      (score * (1.0 - score)))
         return score, elo, elo_error
 
-    def _series_confidence(self):
-        """Return normal-approximate evidence for whichever engine leads."""
-        values = self._series_elo_values()
-        if values is None:
-            return None
-
-        _, elo, elo_error_95 = values
-        elo_standard_error = elo_error_95 / 1.96
-        if elo_standard_error <= 0.0:
-            return None
-
-        candidate_probability = NormalDist().cdf(elo / elo_standard_error)
-        if candidate_probability >= 0.5:
-            return candidate_probability, self.MAIN_AI_NAME
-        return 1.0 - candidate_probability, self.OPPONENT_AI_NAME
+    def _series_pair_scores(self):
+        """Completed, scored colour-swapped pairs as candidate points out of 2."""
+        scores = self.ai_series_game_scores
+        return [scores[index] + scores[index + 1]
+                for index in range(0, len(scores) - 1, 2)
+                if scores[index] is not None and scores[index + 1] is not None]
 
     def _series_max_games_limit(self):
         """Return a safe, even game limit so colour-swapped pairs stay intact."""
@@ -1932,14 +1988,25 @@ class EnhancedChessApp:
         max_games = max(2, max_games)
         return max_games if max_games % 2 == 0 else max_games + 1
 
+    def _series_confidence(self):
+        """One-sided normal estimate of the chance the candidate scores > 50%."""
+        values = self._series_elo_values()
+        if values is None:
+            return None
+        _, elo, elo_error_95 = values
+        standard_error = elo_error_95 / 1.96
+        if standard_error <= 0.0:
+            return None
+        candidate_probability = NormalDist().cdf(elo / standard_error)
+        if candidate_probability >= 0.5:
+            return candidate_probability, self.MAIN_AI_NAME
+        return 1.0 - candidate_probability, self.OPPONENT_AI_NAME
+
     def _series_confidence_threshold(self):
-        """Return a valid confidence threshold even while its spinbox is edited."""
         try:
             threshold = float(self.ai_series_confidence.get())
         except (tk.TclError, TypeError, ValueError):
-            threshold = 95.0
-        if not math.isfinite(threshold):
-            threshold = 95.0
+            threshold = self.AI_SERIES_DEFAULT_CONFIDENCE
         return min(99.9, max(50.0, threshold)) / 100.0
 
     def _series_stop_reason(self):
@@ -1954,11 +2021,8 @@ class EnhancedChessApp:
                 return f"maximum of {max_games} games reached"
 
         if self.ai_series_use_confidence.get():
-            scored_games = (self.ai_series_stats['my_ai_wins'] + self.ai_series_stats['draws'] +
-                            self.ai_series_stats['op_ai_wins'])
             confidence = self._series_confidence()
-            threshold = self._series_confidence_threshold()
-            if scored_games >= self.AI_SERIES_MIN_CONFIDENCE_GAMES and confidence and confidence[0] >= threshold:
+            if confidence and confidence[0] >= self._series_confidence_threshold():
                 return f"{confidence[1]} stronger at {confidence[0]:.1%} confidence"
         return None
 
@@ -1967,46 +2031,94 @@ class EnhancedChessApp:
         if self.ai_series_use_max_games.get():
             limits.append(f"Max games: {self._series_max_games_limit()}")
         if self.ai_series_use_confidence.get():
-            threshold = self._series_confidence_threshold() * 100.0
-            limits.append(f"Confidence: {threshold:.1f}% (minimum {self.AI_SERIES_MIN_CONFIDENCE_GAMES} scored games)")
+            limits.append(f"Confidence: {self._series_confidence_threshold() * 100:.1f}%")
         return "  |  ".join(limits) if limits else "No limit"
 
+    def _series_compact_status(self):
+        """Short progress text for the narrow live sidebar."""
+        games = self.ai_series_stats['game_count']
+        if self.ai_series_use_max_games.get():
+            progress = f"{games}/{self._series_max_games_limit()} games"
+        else:
+            progress = f"{games} games"
+        if self.ai_series_use_confidence.get():
+            progress += f"  •  {self._series_confidence_threshold() * 100:.0f}% stop"
+        return progress
+
     def save_ai_series_results(self):
-        """Write a tab-separated snapshot for copying into the results workbook."""
+        """Write a tab-separated, spreadsheet-ready AI-series snapshot."""
         stats = self.ai_series_stats
-        values = self._series_elo_values()
-        scored_games = stats['my_ai_wins'] + stats['draws'] + stats['op_ai_wins']
         mode = (f"Clock ({int(self.time_control_seconds.get())}s + {self.increment:.1f}s inc)"
                 if self.use_clock_var.get() else f"Fixed depth {self.bot_depth_slider.get()}")
-        score = f"{values[0]:.6f}" if values else "pending"
-        elo = f"{values[1]:+.2f}" if values else "pending"
-        margin = f"{values[2]:.2f}" if values else "pending"
         output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AI_Series_Results.txt")
+
+        def value(engine_key, metric, decimals=0):
+            engine = self.ai_series_engine_stats[engine_key]
+            if not engine['moves']:
+                return None
+            if metric == 'moves': return engine['moves']
+            if metric == 'avg_depth': return engine['depth_sum'] / engine['moves']
+            if metric == 'max_depth': return engine['depth_max']
+            if metric == 'avg_nodes': return engine['nodes_sum'] / engine['moves']
+            if metric == 'avg_time': return engine['time_sum'] / engine['moves']
+            if metric == 'max_time': return engine['time_max']
+            if metric == 'avg_knps': return engine['knps_sum'] / engine['moves']
+
+        def cell(number, decimals=0):
+            if number is None:
+                return ""
+            return f"{number:,.{decimals}f}" if decimals else f"{number:,.0f}"
+
+        def stat_row(label, metric, decimals=0):
+            main_value = value('main', metric, decimals)
+            op_value = value('op', metric, decimals)
+            difference = main_value - op_value if main_value is not None and op_value is not None else None
+            return "\t".join((label, cell(main_value, decimals), cell(op_value, decimals),
+                              cell(difference, decimals))) + "\n"
+
+        progress = (f"{stats['game_count']} / {self._series_max_games_limit()} games"
+                    if self.ai_series_use_max_games.get() else f"{stats['game_count']} games")
+        stop_summary = (f"{self._series_confidence_threshold() * 100:.0f}% stop"
+                        if self.ai_series_use_confidence.get() else "No confidence stop")
 
         try:
             with open(output_path, "w", encoding="utf-8", newline="") as output:
-                output.write(f"AI Series Results\t{mode}\t{self._series_stop_description()}\n")
-                output.write("Candidate\tBaseline\tGames\tWins\tDraws\tLosses\tScored Games\tScore\tElo\t95% Elo Margin\tAborts\tEnd Reason\n")
-                output.write(
-                    f"{self.MAIN_AI_NAME}\t{self.OPPONENT_AI_NAME}\t"
-                    f"{stats['game_count']}\t{stats['my_ai_wins']}\t{stats['draws']}\t"
-                    f"{stats['op_ai_wins']}\t{scored_games}\t{score}\t{elo}\t{margin}\t"
-                    f"{stats.get('aborts', 0)}\t{self.ai_series_completion_reason or 'running'}\n"
-                )
+                output.write(f"AI Series Results\t{mode}\t{progress}\t{stop_summary}\n")
+                output.write(f"{self.MAIN_AI_NAME}\t{stats['my_ai_wins']}\t"
+                             f"{self.OPPONENT_AI_NAME}\t{stats['op_ai_wins']}\t"
+                             f"Draws\t{stats['draws']}\n\n")
+                output.write(self._series_elo_text() + "\n")
+                if stats.get('aborts'):
+                    output.write(f"Aborts\t{stats['aborts']}\n")
+                if self.ai_series_completion_reason:
+                    output.write(f"Stopped\t{self.ai_series_completion_reason}\n")
+                output.write("\n")
+                output.write(f"\t{self.MAIN_AI_NAME}\t{self.OPPONENT_AI_NAME}\tDiff\n")
+                output.write(stat_row("Moves", 'moves'))
+                output.write(stat_row("Avg depth (68%)", 'avg_depth', 1))
+                output.write(stat_row("Max depth", 'max_depth'))
+                output.write(stat_row("Avg nodes", 'avg_nodes'))
+                output.write(stat_row("Avg final iteration (s)", 'avg_time', 3))
+                output.write(stat_row("Max final iteration (s)", 'max_time', 3))
+                output.write(stat_row("Avg KNPS", 'avg_knps', 1))
         except OSError as error:
             print(f"Failed to write AI series results: {error}")
 
     def process_ai_series_result(self):
         self.ai_series_stats['game_count'] += 1
         result, winner = self.game_result
+        candidate_score = None
         if result == 'aborted':
             self.ai_series_stats['aborts'] = self.ai_series_stats.get('aborts', 0) + 1
         elif winner:
             main_color = 'white' if self.white_playing_bot_type == 'main' else 'black'
             key = 'my_ai_wins' if winner == main_color else 'op_ai_wins'
             self.ai_series_stats[key] += 1
+            candidate_score = 1.0 if winner == main_color else 0.0
         else:
             self.ai_series_stats['draws'] += 1
+            candidate_score = 0.5
+        self.ai_series_game_scores.append(candidate_score)
 
         stop_reason = self._series_stop_reason()
         if self.ai_series_running and stop_reason is None:
@@ -2024,6 +2136,9 @@ class EnhancedChessApp:
         self._stop_ai_process()
         self.game_mode.set(GameMode.AI_VS_AI.value)
         self.ai_series_stats = {'game_count': 0, 'my_ai_wins': 0, 'op_ai_wins': 0, 'draws': 0}
+        self.ai_series_game_scores = []
+        self.ai_series_engine_stats = self._new_series_engine_stats()
+        self._search_task_stats.clear()
         self.current_opening_sequence = []
         self.ai_series_running = True
         self.ai_series_completion_reason = None
@@ -2036,12 +2151,20 @@ class EnhancedChessApp:
             self.current_opening_sequence = self._generate_series_opening()
 
         self._pause_clock()
+        opening_san = []
         for move in self.current_opening_sequence:
+            board_before = self.board.clone()
+            player = self.turn
             promo = move[2] if len(move) > 2 and move[2] is not None else Queen
             self.board.make_move(move[0], move[1], promo)
-            self.execute_move_and_check_state(self.turn, move)
+            san = format_move_san(board_before, self.board, move)
+            opening_san.append(san)
+            self.execute_move_and_check_state(player, move)
             if self.game_over:
                 return
+        if opening_san:
+            # Compact SAN mirrors standard move-list notation: "1. e4, e5".
+            print(f"\n--- Series Opening: 1. {', '.join(opening_san)} ---")
         self.last_clock_tick = time.time()
         self.clock_running = False
 
@@ -2053,9 +2176,8 @@ class EnhancedChessApp:
 
         stats = self.ai_series_stats
         text = (
-            f"{self.MAIN_AI_NAME} vs {self.OPPONENT_AI_NAME} "
-            f"({stats['game_count']} games; {self._series_stop_description()})\n"
-            f"W: {stats['my_ai_wins']}  D: {stats['draws']}  L: {stats['op_ai_wins']}\n"
+            f"Series: {self._series_compact_status()}\n"
+            f"W {stats['my_ai_wins']}   D {stats['draws']}   L {stats['op_ai_wins']}\n"
             f"{self._series_elo_text()}"
         )
         if stats.get('aborts'):
